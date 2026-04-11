@@ -10,7 +10,8 @@ from typing import List
 
 import numpy as np
 from sentence_transformers import SentenceTransformer
-from tqdm import tqdm
+
+from src.utils.errors import EmbeddingError
 
 logger = logging.getLogger(__name__)
 
@@ -28,8 +29,15 @@ class EmbeddingService:
 
     def __init__(self) -> None:
         logger.info("Loading sentence-transformer model '%s' …", _MODEL_NAME)
-        self.model: SentenceTransformer = SentenceTransformer(_MODEL_NAME)
-        logger.info("Model loaded successfully (dimension=%d)", _EMBEDDING_DIMENSION)
+        try:
+            self.model: SentenceTransformer = SentenceTransformer(_MODEL_NAME)
+        except Exception as exc:
+            raise EmbeddingError(
+                f"Failed to load embedding model '{_MODEL_NAME}': {exc}"
+            ) from exc
+        logger.info(
+            "Model loaded successfully (dimension=%d)", _EMBEDDING_DIMENSION
+        )
 
     # ------------------------------------------------------------------ #
     #  Single-text embedding
@@ -44,14 +52,22 @@ class EmbeddingService:
 
         Returns:
             A 1-D ``numpy.ndarray`` of shape ``(384,)`` with dtype ``float32``.
+
+        Raises:
+            EmbeddingError: If encoding fails.
         """
         logger.debug("Embedding single text (%d chars)", len(text))
-        embedding: np.ndarray = self.model.encode(
-            text,
-            convert_to_numpy=True,
-            show_progress_bar=False,
-        )
-        return embedding.astype(np.float32)
+        try:
+            embedding: np.ndarray = self.model.encode(
+                text,
+                convert_to_numpy=True,
+                show_progress_bar=False,
+            )
+            return embedding.astype(np.float32)
+        except Exception as exc:
+            raise EmbeddingError(
+                f"Failed to embed text: {exc}"
+            ) from exc
 
     # ------------------------------------------------------------------ #
     #  Batch embedding
@@ -69,23 +85,30 @@ class EmbeddingService:
         Returns:
             A 2-D ``numpy.ndarray`` of shape ``(len(chunks), 384)``
             with dtype ``float32``.
+
+        Raises:
+            EmbeddingError: If encoding fails.
         """
         logger.info("Embedding %d chunks …", len(chunks))
+        try:
+            embeddings: np.ndarray = self.model.encode(
+                chunks,
+                convert_to_numpy=True,
+                show_progress_bar=True,
+                batch_size=32,
+            )
+            embeddings = embeddings.astype(np.float32)
 
-        embeddings: np.ndarray = self.model.encode(
-            chunks,
-            convert_to_numpy=True,
-            show_progress_bar=True,
-            batch_size=32,
-        )
-        embeddings = embeddings.astype(np.float32)
-
-        logger.info(
-            "Embedding complete — shape %s, dtype %s",
-            embeddings.shape,
-            embeddings.dtype,
-        )
-        return embeddings
+            logger.info(
+                "Embedding complete — shape %s, dtype %s",
+                embeddings.shape,
+                embeddings.dtype,
+            )
+            return embeddings
+        except Exception as exc:
+            raise EmbeddingError(
+                f"Failed to embed {len(chunks)} chunks: {exc}"
+            ) from exc
 
     # ------------------------------------------------------------------ #
     #  Metadata
