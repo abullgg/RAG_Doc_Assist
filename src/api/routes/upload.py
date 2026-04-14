@@ -11,7 +11,7 @@ from fastapi import APIRouter, File, HTTPException, UploadFile
 from src.core.config import settings
 from src.ingestion.processor import DocumentProcessor
 from src.embeddings.embedding import EmbeddingService
-from src.vector_store.faiss_index import RetrievalService
+from src.embeddings.embedding import EmbeddingService
 from src.models.schemas import UploadResponse
 from src.utils.errors import DocumentProcessingError, EmbeddingError, RetrievalError
 import src.main as state
@@ -26,7 +26,6 @@ _processor = DocumentProcessor(
     chunk_overlap=settings.CHUNK_OVERLAP,
 )
 _embedding_service = EmbeddingService()
-_retrieval_service = RetrievalService()
 
 
 @router.post("/upload", response_model=UploadResponse)
@@ -78,7 +77,7 @@ async def upload_document(file: UploadFile = File(...)) -> UploadResponse:
         doc_id: str = _processor.generate_document_id()
 
         # 5. Add to FAISS index
-        state.faiss_index = _retrieval_service.add_to_index(
+        state.faiss_index = state.retrieval_service.add_to_index(
             embeddings=embeddings,
             doc_id=doc_id,
             chunks=chunks,

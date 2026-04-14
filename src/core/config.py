@@ -14,8 +14,8 @@ class Settings(BaseSettings):
     PROJECT_NAME: str = "RAG Document Assistant"
 
     # LLM Settings
-    ANTHROPIC_API_KEY: str = ""  # Optional at startup; required for /ask
-    MODEL_NAME: str = "claude-3-5-sonnet-20241022"
+    OLLAMA_BASE_URL: str = "http://localhost:11434"
+    MODEL_NAME: str = "gemma4:e4b"
 
     # Vector DB Settings
     FAISS_INDEX_PATH: str = "./data/faiss_index"
@@ -24,7 +24,7 @@ class Settings(BaseSettings):
     CHUNK_SIZE: int = 500
     CHUNK_OVERLAP: int = 50
 
-    model_config = SettingsConfigDict(env_file=".env", case_sensitive=True)
+    model_config = SettingsConfigDict(env_file=".env", case_sensitive=True, extra="ignore")
 
 
 settings = Settings()

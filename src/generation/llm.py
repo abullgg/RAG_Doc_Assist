@@ -1,27 +1,19 @@
 """
 LLM Service
 ============
-Interfaces with the **Anthropic Claude** API to generate grounded answers
+Interfaces with the **Ollama** local API to generate grounded answers
 based on retrieved context chunks.
 """
 
 import logging
-import os
 from typing import Optional
 
-import anthropic
-from dotenv import load_dotenv
+import ollama
 
 from src.utils.errors import LLMServiceError
-
-# Load .env so ANTHROPIC_API_KEY is available
-load_dotenv()
+from src.core.config import settings
 
 logger = logging.getLogger(__name__)
-
-# Claude model to use for answer generation
-_MODEL_ID: str = "claude-3-5-sonnet-20241022"
-_MAX_TOKENS: int = 1024
 
 # System-level instruction constraining the model to the provided context
 _SYSTEM_PROMPT: str = (
@@ -36,24 +28,17 @@ _SYSTEM_PROMPT: str = (
 
 class LLMService:
     """
-    Sends context-augmented prompts to Claude and returns the generated answer.
+    Sends context-augmented prompts to Ollama and returns the generated answer.
     """
 
     def __init__(self) -> None:
-        api_key: Optional[str] = os.getenv("ANTHROPIC_API_KEY")
-
-        if not api_key:
-            logger.error(
-                "ANTHROPIC_API_KEY is not set. "
-                "Set it in the environment or in a .env file."
-            )
-            raise LLMServiceError(
-                "Missing ANTHROPIC_API_KEY environment variable. "
-                "Please set it before starting the server."
-            )
-
-        self.client: anthropic.Anthropic = anthropic.Anthropic(api_key=api_key)
-        logger.info("Anthropic client initialised (model=%s)", _MODEL_ID)
+        try:
+            self.client = ollama.Client(host=settings.OLLAMA_BASE_URL)
+            self.model = settings.MODEL_NAME
+            logger.info("Ollama client initialised (model=%s, url=%s)", self.model, settings.OLLAMA_BASE_URL)
+        except Exception as exc:
+            logger.error("Failed to initialise Ollama client: %s", exc)
+            raise LLMServiceError(f"Ollama client init failed: {exc}") from exc
 
     # ------------------------------------------------------------------ #
     #  Answer Generation
@@ -61,7 +46,7 @@ class LLMService:
 
     def generate_answer(self, question: str, context: str) -> str:
         """
-        Call the Claude API with the user's *question* and retrieved *context*.
+        Call the Ollama API with the user's *question* and retrieved *context*.
 
         The system prompt forces the model to answer **only** from the
         supplied context and to cite sources.
@@ -74,7 +59,7 @@ class LLMService:
             The generated answer string.
 
         Raises:
-            LLMServiceError: If the Anthropic API call fails.
+            LLMServiceError: If the Ollama API call fails.
         """
         user_message: str = (
             f"Context:\n"
@@ -85,40 +70,38 @@ class LLMService:
         )
 
         logger.info(
-            "Calling Claude API — question length=%d, context length=%d",
+            "Calling Ollama API (model=%s) — question length=%d, context length=%d",
+            self.model,
             len(question),
             len(context),
         )
 
         try:
-            response = self.client.messages.create(
-                model=_MODEL_ID,
-                max_tokens=_MAX_TOKENS,
-                system=_SYSTEM_PROMPT,
+            # We use chat since it maintains dialogue structure via role messages
+            response = self.client.chat(
+                model=self.model,
                 messages=[
+                    {"role": "system", "content": _SYSTEM_PROMPT},
                     {"role": "user", "content": user_message},
                 ],
             )
+            
+            # Extract content from response dictionary safely
+            answer: str = response.get('message', {}).get('content', '')
 
-            answer: str = response.content[0].text
-
-            # Log token usage for cost tracking / debugging
-            usage = response.usage
+            # Extract token details for logging
+            input_tokens = response.get('prompt_eval_count', 0)
+            output_tokens = response.get('eval_count', 0)
             logger.info(
-                "Claude response received — input_tokens=%d, output_tokens=%d",
-                usage.input_tokens,
-                usage.output_tokens,
+                "Ollama response received — input_tokens=%d, output_tokens=%d",
+                input_tokens,
+                output_tokens,
             )
 
             return answer
 
-        except anthropic.APIError as exc:
-            logger.error("Anthropic API error: %s", exc)
-            raise LLMServiceError(
-                f"Failed to get a response from Claude: {exc}"
-            ) from exc
         except Exception as exc:
-            logger.error("Unexpected error during LLM call: %s", exc)
+            logger.error("Error during Ollama call: %s", exc)
             raise LLMServiceError(
-                f"Unexpected error generating answer: {exc}"
+                f"Failed to get a response from Ollama: {exc}"
             ) from exc

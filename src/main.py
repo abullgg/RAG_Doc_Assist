@@ -15,6 +15,8 @@ from typing import Dict, Optional
 import faiss
 from fastapi import FastAPI
 
+from src.vector_store.faiss_index import RetrievalService
+
 from src.core.config import settings
 from src.utils.logger import setup_logging
 from src.api.routes import upload, ask, health
@@ -35,6 +37,9 @@ indexed_documents: Dict[str, dict] = {}
 
 # The shared FAISS index (created on first upload)
 faiss_index: Optional[faiss.IndexFlatL2] = None
+
+# Shared Retrieval Service instance (holds the mapping of chunks)
+retrieval_service = RetrievalService()
 
 # ------------------------------------------------------------------ #
 #  FastAPI Application

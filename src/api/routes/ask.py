@@ -9,7 +9,7 @@ import numpy as np
 from fastapi import APIRouter, HTTPException
 
 from src.embeddings.embedding import EmbeddingService
-from src.vector_store.faiss_index import RetrievalService
+from src.embeddings.embedding import EmbeddingService
 from src.generation.llm import LLMService
 from src.models.schemas import AskRequest, AskResponse
 from src.utils.errors import EmbeddingError, RetrievalError, LLMServiceError
@@ -22,8 +22,8 @@ router = APIRouter()
 # Re-use the same service singletons that upload.py creates.
 # EmbeddingService is heavy (loads the model), so we import lazily to
 # avoid loading the model twice if upload.py was imported first.
+# avoid loading the model twice if upload.py was imported first.
 _embedding_service: Optional[EmbeddingService] = None
-_retrieval_service: Optional[RetrievalService] = None
 _llm_service: Optional[LLMService] = None
 
 
@@ -32,13 +32,6 @@ def _get_embedding_service() -> EmbeddingService:
     if _embedding_service is None:
         _embedding_service = EmbeddingService()
     return _embedding_service
-
-
-def _get_retrieval_service() -> RetrievalService:
-    global _retrieval_service
-    if _retrieval_service is None:
-        _retrieval_service = RetrievalService()
-    return _retrieval_service
 
 
 def _get_llm_service() -> LLMService:
@@ -78,13 +71,12 @@ async def ask_question(request: AskRequest) -> AskResponse:
 
     try:
         embedding_svc = _get_embedding_service()
-        retrieval_svc = _get_retrieval_service()
 
         # 1. Embed the question
         query_embedding: np.ndarray = embedding_svc.embed_text(request.question)
 
         # 2. Search FAISS
-        results: List[Dict] = retrieval_svc.search(
+        results: List[Dict] = state.retrieval_service.search(
             query_embedding=query_embedding,
             faiss_index=state.faiss_index,
             top_k=request.top_k,
