@@ -19,7 +19,11 @@ from src.vector_store.faiss_index import RetrievalService
 
 from src.core.config import settings
 from src.utils.logger import setup_logging
-from src.api.routes import upload, ask, health
+from src.api.routes import upload, ask, health, status
+from src.persistence.storage import PersistentStorage
+from src.tasks.job_tracker import UploadJobTracker
+
+storage = PersistentStorage()
 
 # ------------------------------------------------------------------ #
 #  Bootstrap
@@ -41,6 +45,14 @@ faiss_index: Optional[faiss.IndexFlatL2] = None
 # Shared Retrieval Service instance (holds the mapping of chunks)
 retrieval_service = RetrievalService()
 
+# Global Job Tracker
+job_tracker = UploadJobTracker()
+
+# Load state from disk
+logger.info("Loading persisted state...")
+faiss_index, indexed_documents, chunk_storage = storage.load_state()
+retrieval_service._chunk_store = chunk_storage
+
 # ------------------------------------------------------------------ #
 #  FastAPI Application
 # ------------------------------------------------------------------ #
@@ -58,6 +70,7 @@ app = FastAPI(
 app.include_router(health.router, tags=["monitoring"])
 app.include_router(upload.router, tags=["upload"])
 app.include_router(ask.router, tags=["query"])
+app.include_router(status.router, tags=["status"])
 
 
 @app.get("/")

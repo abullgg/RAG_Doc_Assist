@@ -29,16 +29,18 @@ class DocumentProcessor:
     #  Text Extraction
     # ------------------------------------------------------------------ #
 
-    async def extract_text(self, file_upload: UploadFile) -> str:
+    async def extract_text(self, raw_bytes: bytes, filename: str, content_type: str) -> str:
         """
-        Read the uploaded file and return its full text content.
+        Read the bytes and return its full text content.
 
         Supports:
             - application/pdf  → extracted via PyPDF2
             - text/plain (.txt) → decoded as UTF-8 (latin-1 fallback)
 
         Args:
-            file_upload: A FastAPI ``UploadFile`` object.
+            raw_bytes: Raw file bytes loaded into memory.
+            filename: File name string.
+            content_type: MIME string.
 
         Returns:
             The extracted text as a single string.
@@ -46,13 +48,9 @@ class DocumentProcessor:
         Raises:
             DocumentProcessingError: If the file type is unsupported or empty.
         """
-        filename: str = file_upload.filename or ""
-        content_type: str = file_upload.content_type or ""
         logger.info(
             "Extracting text from '%s' (content_type=%s)", filename, content_type
         )
-
-        raw_bytes: bytes = await file_upload.read()
 
         if not raw_bytes:
             raise DocumentProcessingError(

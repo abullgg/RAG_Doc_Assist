@@ -50,9 +50,10 @@ class UploadResponse(BaseModel):
     """Response schema for POST /upload."""
     document_id: str
     filename: str
-    chunks_created: int
+    chunks_created: Optional[int] = 0
     status: str
     message: str
+    job_id: Optional[str] = None
 
 
 # ------------------------------------------------------------------ #

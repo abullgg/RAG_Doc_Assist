@@ -3,17 +3,18 @@ POST /upload — Document Ingestion Endpoint
 """
 
 import logging
+import uuid
 from typing import List
 
 import numpy as np
-from fastapi import APIRouter, File, HTTPException, UploadFile
+from fastapi import APIRouter, File, HTTPException, UploadFile, BackgroundTasks
 
 from src.core.config import settings
 from src.ingestion.processor import DocumentProcessor
 from src.embeddings.embedding import EmbeddingService
-from src.embeddings.embedding import EmbeddingService
 from src.models.schemas import UploadResponse
 from src.utils.errors import DocumentProcessingError, EmbeddingError, RetrievalError
+from src.tasks.uploader import process_upload_task
 import src.main as state
 
 logger = logging.getLogger(__name__)
@@ -29,92 +30,88 @@ _embedding_service = EmbeddingService()
 
 
 @router.post("/upload", response_model=UploadResponse)
-async def upload_document(file: UploadFile = File(...)) -> UploadResponse:
+async def upload_document(
+    background_tasks: BackgroundTasks,
+    file: UploadFile = File(...)
+) -> UploadResponse:
     """
     Upload & Index a Document.
 
-    Accepts a PDF or TXT file, extracts text, splits it into overlapping
-    chunks, embeds each chunk, and adds the vectors to the FAISS index.
+    Accepts a PDF or TXT file. Files < 1MB process instantly.
+    Files > 1MB automatically queue into the asynchronous background queue.
     """
     filename: str = file.filename or "unknown"
+    content_type: str = file.content_type or ""
     logger.info("===== Upload request: '%s' =====", filename)
 
-    # --- Validate file type -----------------------------------------------
+    # Validate file type
     allowed_extensions = (".pdf", ".txt")
     if not filename.lower().endswith(allowed_extensions):
         logger.warning("Rejected file '%s': unsupported type", filename)
         raise HTTPException(
             status_code=400,
-            detail=(
-                f"Unsupported file type: '{filename}'. "
-                f"Allowed types: {', '.join(allowed_extensions)}"
-            ),
+            detail=f"Unsupported file type: '{filename}'. Allowed types: {', '.join(allowed_extensions)}"
         )
 
     try:
-        # 1. Extract text
-        text: str = await _processor.extract_text(file)
+        # Buffer entire file into memory immediately so FastAPI doesn't delete the temporary 
+        # buffer while the background queue is processing it.
+        raw_bytes: bytes = await file.read()
+        
+        # Determine background threshold (1MB = 1024 * 1024 bytes)
+        file_size = len(raw_bytes)
+        is_large = file_size > (1024 * 1024)
+        
+        # Create Job Tracking Token
+        job_id = str(uuid.uuid4())
+        state.job_tracker.create_job(job_id, filename)
 
-        if not text.strip():
-            raise HTTPException(
-                status_code=400,
-                detail=f"No readable text found in '{filename}'.",
+        if is_large:
+            logger.info(f"File Size ({file_size}b) > 1MB. Queuing to background...")
+            background_tasks.add_task(
+                process_upload_task,
+                job_id=job_id,
+                raw_bytes=raw_bytes,
+                filename=filename,
+                content_type=content_type,
+                processor=_processor,
+                embedding_service=_embedding_service
             )
-
-        # 2. Chunk the text
-        chunks: List[str] = _processor.chunk_text(text)
-
-        if not chunks:
-            raise HTTPException(
-                status_code=400,
-                detail=f"Text from '{filename}' produced no usable chunks.",
+            return UploadResponse(
+                document_id=job_id,
+                filename=filename,
+                job_id=job_id,
+                status="queued",
+                message="File is large and currently queuing for background inference."
             )
-
-        # 3. Embed the chunks
-        embeddings: np.ndarray = _embedding_service.embed_chunks(chunks)
-
-        # 4. Generate a document ID
-        doc_id: str = _processor.generate_document_id()
-
-        # 5. Add to FAISS index
-        state.faiss_index = state.retrieval_service.add_to_index(
-            embeddings=embeddings,
-            doc_id=doc_id,
-            chunks=chunks,
-            existing_index=state.faiss_index,
-        )
-
-        # 6. Record in the global registry
-        state.indexed_documents[doc_id] = {
-            "filename": filename,
-            "chunks_created": len(chunks),
-            "text_length": len(text),
-        }
-
-        logger.info(
-            "Document '%s' indexed as %s — %d chunks",
-            filename, doc_id, len(chunks),
-        )
-
-        return UploadResponse(
-            document_id=doc_id,
-            filename=filename,
-            chunks_created=len(chunks),
-            status="success",
-            message=f"Document '{filename}' uploaded and indexed successfully.",
-        )
+        else:
+            logger.info(f"File Size ({file_size}b) < 1MB. Running instantaneously...")
+            await process_upload_task(
+                job_id=job_id,
+                raw_bytes=raw_bytes,
+                filename=filename,
+                content_type=content_type,
+                processor=_processor,
+                embedding_service=_embedding_service
+            )
+            
+            job = state.job_tracker.get_job(job_id)
+            if not job or job.get("status") == "failed":
+                raise HTTPException(status_code=500, detail=job.get("error", "Unknown ingestion error"))
+                
+            return UploadResponse(
+                document_id=job_id,
+                filename=filename,
+                chunks_created=job.get("chunks_created", 0),
+                status="completed",
+                message="Document uploaded and indexed successfully."
+            )
 
     except HTTPException:
-        raise  # re-raise validation errors as-is
-    except DocumentProcessingError as exc:
-        logger.error("Document processing error: %s", exc)
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-    except (EmbeddingError, RetrievalError) as exc:
-        logger.error("Pipeline error during upload: %s", exc)
-        raise HTTPException(status_code=500, detail=str(exc)) from exc
+        raise
     except Exception as exc:
-        logger.exception("Unexpected error processing '%s'", filename)
+        logger.exception("Unexpected error pushing '%s' into workflow", filename)
         raise HTTPException(
             status_code=500,
-            detail=f"Internal error while processing '{filename}': {exc}",
+            detail=f"Internal error: {exc}",
         ) from exc
