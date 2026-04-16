@@ -93,6 +93,9 @@ async def process_upload_task(
             state.retrieval_service._chunk_store
         )
         
+        # 8. Sync BM25 Keyword Search Index
+        state.hybrid_retriever.index_chunks(state.retrieval_service.get_all_chunks())
+        
         tracker.mark_complete(job_id, len(chunks))
         
     except Exception as exc:

@@ -174,6 +174,42 @@ class RetrievalService:
             ) from exc
 
     # ------------------------------------------------------------------ #
+    #  Hybrid Search
+    # ------------------------------------------------------------------ #
+
+    def get_all_chunks(self) -> List[str]:
+        """Return all text chunks correctly ordered by FAISS integer index."""
+        return [self._chunk_store[i][1] for i in range(len(self._chunk_store))]
+
+    def hybrid_search(self, query_embedding, query_text, faiss_index, hybrid_retriever, top_k=3):
+        """
+        Hybrid search: semantic + keyword combined
+        
+        Args:
+            query_embedding: 384-dim vector
+            query_text: Raw question text
+            faiss_index: FAISS index
+            hybrid_retriever: HybridRetriever instance
+            top_k: Results to return
+        
+        Returns:
+            Tuple of (chunks, scores)
+        """
+        try:
+            chunks, scores = hybrid_retriever.hybrid_search(
+                query_embedding=query_embedding,
+                query_text=query_text,
+                faiss_index=faiss_index,
+                top_k=top_k
+            )
+            return chunks, scores
+        except Exception as e:
+            logger.error(f"Hybrid search failed: {str(e)}")
+            # Fallback to semantic-only
+            results = self.search(query_embedding, faiss_index, top_k)
+            return [r["chunk"] for r in results], [r["score"] for r in results]
+
+    # ------------------------------------------------------------------ #
     #  Stats
     # ------------------------------------------------------------------ #
 

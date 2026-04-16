@@ -22,6 +22,7 @@ from src.utils.logger import setup_logging
 from src.api.routes import upload, ask, health, status
 from src.persistence.storage import PersistentStorage
 from src.tasks.job_tracker import UploadJobTracker
+from src.retrieval.hybrid import HybridRetriever
 
 storage = PersistentStorage()
 
@@ -48,10 +49,14 @@ retrieval_service = RetrievalService()
 # Global Job Tracker
 job_tracker = UploadJobTracker()
 
+# Global Hybrid Search Engine
+hybrid_retriever = HybridRetriever()
+
 # Load state from disk
 logger.info("Loading persisted state...")
 faiss_index, indexed_documents, chunk_storage = storage.load_state()
 retrieval_service._chunk_store = chunk_storage
+hybrid_retriever.index_chunks(retrieval_service.get_all_chunks())
 
 # ------------------------------------------------------------------ #
 #  FastAPI Application

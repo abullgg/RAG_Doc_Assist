@@ -75,14 +75,26 @@ async def ask_question(request: AskRequest) -> AskResponse:
         # 1. Embed the question
         query_embedding: np.ndarray = embedding_svc.embed_text(request.question)
 
-        # 2. Search FAISS
-        results: List[Dict] = state.retrieval_service.search(
-            query_embedding=query_embedding,
-            faiss_index=state.faiss_index,
-            top_k=request.top_k,
-        )
+        # 2. Hybrid / Semantic Search
+        use_hybrid = True
+        if use_hybrid:
+            source_texts, similarities = state.retrieval_service.hybrid_search(
+                query_embedding=query_embedding,
+                query_text=request.question,
+                faiss_index=state.faiss_index,
+                hybrid_retriever=state.hybrid_retriever,
+                top_k=request.top_k
+            )
+        else:
+            results: List[Dict] = state.retrieval_service.search(
+                query_embedding=query_embedding,
+                faiss_index=state.faiss_index,
+                top_k=request.top_k,
+            )
+            source_texts = [r["chunk"] for r in results]
+            similarities = [r["score"] for r in results]
 
-        if not results:
+        if not source_texts:
             return AskResponse(
                 answer="No relevant information was found in the indexed documents.",
                 sources=[],
@@ -90,7 +102,6 @@ async def ask_question(request: AskRequest) -> AskResponse:
             )
 
         # 3. Build context from retrieved chunks
-        source_texts: List[str] = [r["chunk"] for r in results]
         context: str = "\n\n---\n\n".join(
             f"[Source {i + 1}]:\n{chunk}"
             for i, chunk in enumerate(source_texts)
@@ -105,7 +116,7 @@ async def ask_question(request: AskRequest) -> AskResponse:
 
         # 5. Compute average confidence from similarity scores
         avg_confidence: float = round(
-            sum(r["score"] for r in results) / len(results), 4
+            sum(similarities) / len(similarities), 4
         )
 
         logger.info(
