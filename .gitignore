@@ -154,3 +154,9 @@ cython_debug/
 # Project specific
 data/*
 !data/.gitkeep
+
+# Temporary tests and text documents
+*.txt
+!requirements.txt
+debug_test.py
+persistence_tests.py

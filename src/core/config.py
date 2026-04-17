@@ -15,7 +15,7 @@ class Settings(BaseSettings):
 
     # LLM Settings
     OLLAMA_BASE_URL: str = "http://localhost:11434"
-    MODEL_NAME: str = "gemma4:e4b"
+    MODEL_NAME: str = "gemma3:4b"
 
     # Vector DB Settings
     FAISS_INDEX_PATH: str = "./data/faiss_index"
