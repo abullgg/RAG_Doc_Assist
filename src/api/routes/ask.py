@@ -83,13 +83,15 @@ async def ask_question(request: AskRequest) -> AskResponse:
                 query_text=request.question,
                 faiss_index=state.faiss_index,
                 hybrid_retriever=state.hybrid_retriever,
-                top_k=request.top_k
+                top_k=request.top_k,
+                filter_doc_id=request.document_id
             )
         else:
             results: List[Dict] = state.retrieval_service.search(
                 query_embedding=query_embedding,
                 faiss_index=state.faiss_index,
                 top_k=request.top_k,
+                filter_doc_id=request.document_id
             )
             source_texts = [r["chunk"] for r in results]
             similarities = [r["score"] for r in results]

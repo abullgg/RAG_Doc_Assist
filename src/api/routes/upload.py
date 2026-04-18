@@ -22,10 +22,7 @@ logger = logging.getLogger(__name__)
 router = APIRouter()
 
 # Service singletons (created once when this module is first imported)
-_processor = DocumentProcessor(
-    chunk_size=settings.CHUNK_SIZE,
-    chunk_overlap=settings.CHUNK_OVERLAP,
-)
+_processor = DocumentProcessor()
 _embedding_service = EmbeddingService()
 
 

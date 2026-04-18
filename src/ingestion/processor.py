@@ -1,8 +1,8 @@
 """
 Document Processor
 ==================
-Handles file ingestion (PDF / TXT), text extraction, chunking with
-character-level overlap, and unique document ID generation.
+Handles file ingestion (PDF / TXT), text extraction, semantic chunking with
+LangChain's RecursiveCharacterTextSplitter, and unique document ID generation.
 """
 
 import io
@@ -11,7 +11,8 @@ import uuid
 from typing import List
 
 from fastapi import UploadFile
-from PyPDF2 import PdfReader
+import pdfplumber
+from langchain_text_splitters import RecursiveCharacterTextSplitter
 
 from src.utils.errors import DocumentProcessingError
 
@@ -19,11 +20,26 @@ logger = logging.getLogger(__name__)
 
 
 class DocumentProcessor:
-    """Extracts text from uploaded files and splits it into overlapping chunks."""
+    """Extracts text from uploaded files and splits it into semantic chunks."""
 
-    def __init__(self, chunk_size: int = 500, chunk_overlap: int = 50) -> None:
-        self.chunk_size = chunk_size
-        self.chunk_overlap = chunk_overlap
+    def __init__(self) -> None:
+        # Initialize RecursiveCharacterTextSplitter with hierarchical separators.
+        # The splitter tries each separator in order, only falling back to the
+        # next one when a chunk still exceeds chunk_size.
+        self.splitter = RecursiveCharacterTextSplitter(
+            chunk_size=2000,           # Target chunk size in characters
+            chunk_overlap=200,         # Overlap for cross-boundary context
+            separators=[
+                "\n\n",                # 1. Split on paragraphs (preferred)
+                "\n",                  # 2. Split on lines
+                ". ",                  # 3. Split on sentences
+                " ",                   # 4. Split on words (rare)
+                ""                     # 5. Split on characters (last resort)
+            ],
+            length_function=len,
+            is_separator_regex=False,
+        )
+        logger.info("DocumentProcessor initialized with LangChain semantic splitter")
 
     # ------------------------------------------------------------------ #
     #  Text Extraction
@@ -34,7 +50,7 @@ class DocumentProcessor:
         Read the bytes and return its full text content.
 
         Supports:
-            - application/pdf  → extracted via PyPDF2
+            - application/pdf  → extracted via pdfplumber (layout-aware)
             - text/plain (.txt) → decoded as UTF-8 (latin-1 fallback)
 
         Args:
@@ -76,32 +92,34 @@ class DocumentProcessor:
 
     @staticmethod
     def _extract_pdf(raw_bytes: bytes, filename: str) -> str:
-        """Parse PDF bytes and concatenate all page texts."""
+        """Parse PDF bytes using pdfplumber (layout-aware) and concatenate all page texts."""
         try:
-            reader = PdfReader(io.BytesIO(raw_bytes))
             pages_text: List[str] = []
-            for page_num, page in enumerate(reader.pages):
-                page_text = page.extract_text() or ""
-                if page_text.strip():
-                    pages_text.append(page_text)
-                    logger.debug(
-                        "Page %d of '%s': extracted %d chars",
-                        page_num + 1,
-                        filename,
-                        len(page_text),
-                    )
+            num_pages = 0
+            with pdfplumber.open(io.BytesIO(raw_bytes)) as pdf:
+                num_pages = len(pdf.pages)
+                for page_num, page in enumerate(pdf.pages):
+                    page_text = page.extract_text() or ""
+                    if page_text.strip():
+                        pages_text.append(page_text)
+                        logger.debug(
+                            "Page %d of '%s': extracted %d chars",
+                            page_num + 1,
+                            filename,
+                            len(page_text),
+                        )
 
             full_text = "\n".join(pages_text)
             logger.info(
-                "PDF '%s': %d pages, %d chars total",
+                "PDF '%s': %d pages, %d chars total (pdfplumber)",
                 filename,
-                len(reader.pages),
+                num_pages,
                 len(full_text),
             )
             return full_text
 
         except Exception as exc:
-            logger.error("Failed to parse PDF '%s': %s", filename, exc)
+            logger.error("Failed to parse PDF '%s' with pdfplumber: %s", filename, exc)
             raise DocumentProcessingError(
                 f"Could not parse PDF '{filename}': {exc}"
             ) from exc
@@ -125,56 +143,48 @@ class DocumentProcessor:
     #  Chunking
     # ------------------------------------------------------------------ #
 
-    def chunk_text(
-        self,
-        text: str,
-        chunk_size: int | None = None,
-        overlap: int | None = None,
-    ) -> List[str]:
+    def chunk_text(self, text: str) -> List[str]:
         """
-        Split *text* into chunks of approximately *chunk_size* characters
-        with *overlap* characters shared between consecutive chunks.
+        Split text into semantic chunks using LangChain's RecursiveCharacterTextSplitter.
 
-        Empty or whitespace-only chunks are silently dropped.
+        The splitter respects paragraph boundaries, sentence boundaries, and
+        document structure — headers stay with their content instead of being
+        orphaned into separate chunks.
 
         Args:
-            text:       The full document text.
-            chunk_size: Max characters per chunk (defaults to instance setting).
-            overlap:    Characters repeated across boundaries (defaults to
-                        instance setting).
+            text: The full document text.
 
         Returns:
             A list of non-empty text chunks.
+
+        Raises:
+            DocumentProcessingError: If text is empty or chunking fails.
         """
-        size = chunk_size or self.chunk_size
-        lap = overlap or self.chunk_overlap
-
         if not text or not text.strip():
-            logger.warning("chunk_text received empty text — returning no chunks")
-            return []
+            raise DocumentProcessingError("Cannot chunk empty text")
 
-        chunks: List[str] = []
-        start = 0
-        text_length = len(text)
+        try:
+            chunks = self.splitter.split_text(text)
 
-        while start < text_length:
-            end = start + size
-            chunk = text[start:end]
+            logger.info(
+                "Created %d semantic chunks from text of length %d",
+                len(chunks),
+                len(text),
+            )
+            for i, chunk in enumerate(chunks):
+                logger.debug(
+                    "Chunk %d: %d chars, starts with: %s...",
+                    i,
+                    len(chunk),
+                    chunk[:50],
+                )
 
-            if chunk.strip():
-                chunks.append(chunk)
-
-            # Advance by (chunk_size - overlap) to create the overlap window
-            start += size - lap
-
-        logger.info(
-            "Chunked %d chars → %d chunks (size=%d, overlap=%d)",
-            text_length,
-            len(chunks),
-            size,
-            lap,
-        )
-        return chunks
+            return chunks
+        except Exception as exc:
+            logger.error("Error chunking text: %s", exc)
+            raise DocumentProcessingError(
+                f"Failed to chunk text: {exc}"
+            ) from exc
 
     # ------------------------------------------------------------------ #
     #  ID Generation

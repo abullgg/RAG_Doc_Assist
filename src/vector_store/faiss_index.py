@@ -97,6 +97,7 @@ class RetrievalService:
         query_embedding: np.ndarray,
         faiss_index: faiss.IndexFlatL2,
         top_k: int = 3,
+        filter_doc_id: Optional[str] = None
     ) -> List[Dict[str, object]]:
         """
         Find the *top_k* most similar chunks to *query_embedding*.
@@ -125,12 +126,16 @@ class RetrievalService:
                 query_embedding = query_embedding.reshape(1, -1)
 
             # Clamp top_k to what the index actually holds
-            effective_k: int = min(top_k, faiss_index.ntotal)
+            if filter_doc_id:
+                effective_k = faiss_index.ntotal
+            else:
+                effective_k = min(top_k, faiss_index.ntotal)
 
             logger.info(
-                "Searching FAISS index (%d vectors) for top-%d matches",
+                "Searching FAISS index (%d vectors) for top-%d matches (filter_doc_id=%s)",
                 faiss_index.ntotal,
                 effective_k,
+                filter_doc_id
             )
 
             distances, indices = faiss_index.search(query_embedding, effective_k)
@@ -144,6 +149,9 @@ class RetrievalService:
                 doc_id, chunk_text = self._chunk_store.get(
                     int(idx), ("unknown", "")
                 )
+                
+                if filter_doc_id and doc_id != filter_doc_id:
+                    continue
 
                 # Convert L2 distance → similarity score
                 similarity: float = 1.0 / (1.0 + float(dist))
@@ -164,6 +172,9 @@ class RetrievalService:
                     dist,
                     chunk_text[:80],
                 )
+                
+                if len(results) >= top_k:
+                    break
 
             logger.info("Returning %d search results", len(results))
             return results
@@ -177,11 +188,11 @@ class RetrievalService:
     #  Hybrid Search
     # ------------------------------------------------------------------ #
 
-    def get_all_chunks(self) -> List[str]:
-        """Return all text chunks correctly ordered by FAISS integer index."""
-        return [self._chunk_store[i][1] for i in range(len(self._chunk_store))]
+    def get_all_chunks(self) -> List[Tuple[str, str]]:
+        """Return all (doc_id, text) chunks correctly ordered by FAISS integer index."""
+        return [self._chunk_store[i] for i in range(len(self._chunk_store))]
 
-    def hybrid_search(self, query_embedding, query_text, faiss_index, hybrid_retriever, top_k=3):
+    def hybrid_search(self, query_embedding, query_text, faiss_index, hybrid_retriever, top_k=3, filter_doc_id=None):
         """
         Hybrid search: semantic + keyword combined
         
@@ -200,13 +211,14 @@ class RetrievalService:
                 query_embedding=query_embedding,
                 query_text=query_text,
                 faiss_index=faiss_index,
-                top_k=top_k
+                top_k=top_k,
+                filter_doc_id=filter_doc_id
             )
             return chunks, scores
         except Exception as e:
             logger.error(f"Hybrid search failed: {str(e)}")
             # Fallback to semantic-only
-            results = self.search(query_embedding, faiss_index, top_k)
+            results = self.search(query_embedding, faiss_index, top_k, filter_doc_id=filter_doc_id)
             return [r["chunk"] for r in results], [r["score"] for r in results]
 
     # ------------------------------------------------------------------ #

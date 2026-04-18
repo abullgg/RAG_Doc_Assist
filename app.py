@@ -421,9 +421,13 @@ ask_disabled = not st.session_state.upload_complete or not question
 if st.button("🔍 Get Answer", disabled=ask_disabled, use_container_width=True):
     with st.spinner("Searching documents and generating answer..."):
         try:
+            payload = {"question": question, "top_k": 3}
+            if st.session_state.job_id:
+                payload["document_id"] = st.session_state.job_id
+                
             resp = requests.post(
                 f"{BACKEND_URL}/ask",
-                json={"question": question, "top_k": 3},
+                json=payload,
                 timeout=120,
             )
 
