@@ -14,6 +14,7 @@ from typing import Dict, Optional
 
 import faiss
 from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
 
 from src.vector_store.faiss_index import RetrievalService
 
@@ -69,6 +70,18 @@ app = FastAPI(
         "and ask questions answered by Claude."
     ),
     version="1.0.0",
+)
+
+# ── CORS ── allow the Next.js frontend (dev: 3000, prod: any configured origin)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "http://localhost:3000",
+        "http://127.0.0.1:3000",
+    ],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 # Mount routers
