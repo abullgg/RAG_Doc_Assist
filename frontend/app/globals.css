@@ -850,3 +850,48 @@ body {
 }
 .prose hr { border: none; border-top: 1px solid var(--ghost); margin: 1em 0; }
 .prose a { color: var(--accent-dim); text-decoration: underline; text-underline-offset: 2px; }
+
+/* ── Tables ── */
+.prose table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.84rem;
+  margin: 0.85em 0;
+  display: block;
+  overflow-x: auto;          /* horizontal scroll on narrow screens */
+  white-space: nowrap;
+}
+
+.prose thead tr {
+  background: var(--surface-highest);
+  border-bottom: 2px solid rgba(124, 92, 252, 0.30);
+}
+
+.prose th {
+  padding: 8px 14px;
+  text-align: left;
+  font-weight: 600;
+  color: var(--text);
+  font-size: 0.78rem;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  white-space: nowrap;
+}
+
+.prose td {
+  padding: 7px 14px;
+  color: var(--text);
+  border-bottom: 1px solid var(--ghost);
+  white-space: nowrap;
+}
+
+/* alternating rows */
+.prose tbody tr:nth-child(even) {
+  background: rgba(255, 255, 255, 0.024);
+}
+
+.prose tbody tr:hover {
+  background: rgba(124, 92, 252, 0.06);
+  transition: background 0.12s;
+}
+

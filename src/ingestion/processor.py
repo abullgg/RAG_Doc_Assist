@@ -91,38 +91,112 @@ class DocumentProcessor:
     # ------------------------------------------------------------------ #
 
     @staticmethod
+    def _table_to_markdown(table: list) -> str:
+        """
+        Convert a pdfplumber table (list of rows, each a list of cell strings)
+        into a GitHub-style markdown table string.
+
+        Returns an empty string if the table is empty or contains only blank cells.
+        """
+        if not table:
+            return ""
+
+        # Normalise cells: None → "", strip whitespace
+        cleaned: List[List[str]] = [
+            [str(cell).strip() if cell is not None else "" for cell in row]
+            for row in table
+        ]
+
+        # Skip tables that are entirely blank
+        if all(all(cell == "" for cell in row) for row in cleaned):
+            return ""
+
+        # Pad every row to the same column count
+        col_count = max(len(row) for row in cleaned)
+        padded = [row + [""] * (col_count - len(row)) for row in cleaned]
+
+        lines: List[str] = []
+        # Header (first row)
+        lines.append("| " + " | ".join(padded[0]) + " |")
+        lines.append("| " + " | ".join(["---"] * col_count) + " |")
+        # Data rows
+        for row in padded[1:]:
+            lines.append("| " + " | ".join(row) + " |")
+
+        return "\n".join(lines)
+
+    @staticmethod
     def _extract_pdf(raw_bytes: bytes, filename: str) -> str:
-        """Parse PDF bytes using pdfplumber (layout-aware) and concatenate all page texts."""
+        """
+        Parse PDF bytes and return the full text content.
+
+        Strategy (per page):
+        1. ``page.extract_text()``  — always runs first; preserves the existing
+           prose/paragraph flow that already delivers >92 % accuracy on text docs.
+        2. ``page.extract_tables()`` — runs additionally and silently; any detected
+           tables are converted to markdown and **appended** after the page text.
+           Failures are caught and ignored so text-only docs are never affected.
+        """
         try:
             pages_text: List[str] = []
             num_pages = 0
+
             with pdfplumber.open(io.BytesIO(raw_bytes)) as pdf:
                 num_pages = len(pdf.pages)
+
                 for page_num, page in enumerate(pdf.pages):
+                    parts: List[str] = []
+
+                    # ── 1. Existing flat text extraction (unchanged behaviour) ──
                     page_text = page.extract_text() or ""
                     if page_text.strip():
-                        pages_text.append(page_text)
+                        parts.append(page_text)
                         logger.debug(
-                            "Page %d of '%s': extracted %d chars",
-                            page_num + 1,
-                            filename,
-                            len(page_text),
+                            "Page %d/%d '%s': %d chars (text)",
+                            page_num + 1, num_pages, filename, len(page_text),
                         )
 
-            full_text = "\n".join(pages_text)
+                    # ── 2. Additive table extraction (new) ──
+                    try:
+                        tables = page.extract_tables() or []
+                        table_mds: List[str] = []
+                        for table in tables:
+                            md = DocumentProcessor._table_to_markdown(table)
+                            if md:
+                                table_mds.append(md)
+
+                        if table_mds:
+                            # Label the block clearly so Gemma recognises structure
+                            block = "[TABLE]\n" + "\n\n[TABLE]\n".join(table_mds)
+                            parts.append(block)
+                            logger.debug(
+                                "Page %d/%d '%s': %d table(s) extracted as markdown",
+                                page_num + 1, num_pages, filename, len(table_mds),
+                            )
+
+                    except Exception as tbl_exc:
+                        # Table extraction failure never blocks text extraction
+                        logger.warning(
+                            "Page %d/%d '%s': table extraction skipped (%s)",
+                            page_num + 1, num_pages, filename, tbl_exc,
+                        )
+
+                    if parts:
+                        pages_text.append("\n\n".join(parts))
+
+            full_text = "\n\n".join(pages_text)
             logger.info(
-                "PDF '%s': %d pages, %d chars total (pdfplumber)",
-                filename,
-                num_pages,
-                len(full_text),
+                "PDF '%s': %d pages, %d chars total",
+                filename, num_pages, len(full_text),
             )
             return full_text
 
         except Exception as exc:
-            logger.error("Failed to parse PDF '%s' with pdfplumber: %s", filename, exc)
+            logger.error("Failed to parse PDF '%s': %s", filename, exc)
             raise DocumentProcessingError(
                 f"Could not parse PDF '{filename}': {exc}"
             ) from exc
+
 
     @staticmethod
     def _extract_txt(raw_bytes: bytes, filename: str) -> str:

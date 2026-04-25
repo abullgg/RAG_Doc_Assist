@@ -1,5 +1,6 @@
 'use client';
 import ReactMarkdown from 'react-markdown';
+import remarkGfm from 'remark-gfm';
 import { useState, useRef, useCallback, useEffect } from 'react';
 import {
   checkHealth,
@@ -103,7 +104,7 @@ function AiBubble({ msg }: { msg: Message }) {
       <div className="msg-avatar ai">AI</div>
       <div className="msg-bubble ai">
         <div className="prose">
-          <ReactMarkdown>{msg.content}</ReactMarkdown>
+          <ReactMarkdown remarkPlugins={[remarkGfm]}>{msg.content}</ReactMarkdown>
         </div>
         {pct !== null && (
           <span className={`conf-badge${pct >= 70 ? ' high' : ''}`}>

@@ -67,7 +67,7 @@ app = FastAPI(
     title=settings.PROJECT_NAME,
     description=(
         "Upload PDF / TXT documents, index them with FAISS, "
-        "and ask questions answered by Claude."
+        "and ask questions answered by Gemma via Ollama."
     ),
     version="1.0.0",
 )
