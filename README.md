@@ -1,51 +1,54 @@
 # RAG Document Assistant
 
-Upload a PDF or TXT → it gets chunked, embedded, and indexed → ask questions → get answers grounded in your document. That's it.
+Upload a PDF or TXT → it gets extracted, chunked, embedded, and indexed → ask questions in a chat interface → get answers grounded strictly in your document.
 
 No cloud dependencies. Runs entirely on your machine using Ollama for LLM inference and FAISS for vector search.
 
 ## How It Works
 
 ```
-PDF/TXT  →  Extract Text  →  Chunk (RecursiveCharacterTextSplitter)
-                                      ↓
-                              Embed (all-MiniLM-L6-v2, 384d)
-                                      ↓
-                              Index (FAISS + BM25)
-                                      ↓
-              Question  →  Hybrid Search (70% semantic + 30% keyword)
-                                      ↓
-                              Top-K chunks → Ollama LLM → Answer
+PDF/TXT  →  Extract Text + Tables  →  Chunk (RecursiveCharacterTextSplitter)
+                                               ↓
+                                       Embed (all-MiniLM-L6-v2, 384d)
+                                               ↓
+                                       Index (FAISS + BM25)
+                                               ↓
+               Question  →  Hybrid Search (70% semantic + 30% keyword)
+                                               ↓
+                               Top-K chunks → Ollama (Gemma 3 4B) → Answer
 ```
 
 **Hybrid retrieval** combines FAISS cosine similarity with BM25 keyword matching (weighted 70/30). This catches both semantically similar passages and exact keyword matches that pure vector search would miss.
+
+**Table-aware ingestion**: `pdfplumber` runs both `extract_text()` and `extract_tables()` per page. Detected tables are converted to GitHub-style markdown and appended alongside the prose text so the LLM receives structured data instead of collapsed rows.
 
 ## Tech Stack
 
 | Layer | Tech |
 |---|---|
 | Backend API | FastAPI + Uvicorn |
-| Frontend | Streamlit |
+| Frontend | Next.js 16 (App Router) |
 | LLM | Ollama (default: `gemma3:4b`) |
 | Embeddings | `all-MiniLM-L6-v2` via sentence-transformers |
 | Vector Store | FAISS (IndexFlatL2) |
 | Keyword Search | BM25 (rank-bm25) |
-| PDF Parsing | pdfplumber |
+| PDF Parsing | pdfplumber (text + table extraction) |
 | Text Splitting | LangChain RecursiveCharacterTextSplitter |
+| Markdown Rendering | react-markdown + remark-gfm |
 | Persistence | Pickle-based state persistence to disk |
 
 ## Project Structure
 
 ```
 src/
-├── main.py                  # FastAPI app entry point, global state
+├── main.py                  # FastAPI app entry point, global state, CORS
 ├── api/routes/
-│   ├── upload.py            # POST /upload — file ingestion
-│   ├── ask.py               # POST /ask — question answering
+│   ├── upload.py            # POST /upload — file ingestion + job tracking
+│   ├── ask.py               # POST /ask — question answering with doc isolation
 │   ├── health.py            # GET /health
 │   └── status.py            # GET /status/{job_id}
 ├── ingestion/
-│   └── processor.py         # PDF/TXT extraction + semantic chunking
+│   └── processor.py         # PDF/TXT extraction, table → markdown, chunking
 ├── embeddings/
 │   └── embedding.py         # Sentence-transformer wrapper
 ├── vector_store/
@@ -53,7 +56,7 @@ src/
 ├── retrieval/
 │   └── hybrid.py            # BM25 + FAISS hybrid search
 ├── generation/
-│   └── llm.py               # Ollama LLM client + grounded prompting
+│   └── llm.py               # Ollama client + table-aware system prompt
 ├── persistence/
 │   └── storage.py           # Save/load FAISS index + chunks to disk
 ├── core/
@@ -66,7 +69,13 @@ src/
     ├── logger.py
     └── errors.py
 
-app.py                       # Streamlit frontend (standalone, HTTP only)
+frontend/                    # Next.js 16 App Router frontend
+├── app/
+│   ├── page.tsx             # Main chat interface
+│   ├── globals.css          # Obsidian Flux dark design system
+│   └── layout.tsx
+└── lib/
+    └── api.ts               # Typed API client for all 4 endpoints
 ```
 
 ## Setup
@@ -74,13 +83,14 @@ app.py                       # Streamlit frontend (standalone, HTTP only)
 ### Prerequisites
 
 - Python 3.10+
+- Node.js 18+
 - [Ollama](https://ollama.com/) installed and running
 
-### Install
+### Backend
 
 ```bash
-git clone https://github.com/<your-username>/RAG-doc_assist.git
-cd RAG-doc_assist
+git clone https://github.com/abullgg/RAG_Doc_Assist.git
+cd RAG_Doc_Assist
 python -m venv venv
 venv\Scripts\activate        # Windows
 # source venv/bin/activate   # Linux/Mac
@@ -103,13 +113,32 @@ Create a `.env` file in the project root:
 OLLAMA_BASE_URL=http://localhost:11434
 MODEL_NAME=gemma3:4b
 FAISS_INDEX_PATH=./data/faiss_index
-CHUNK_SIZE=500
-CHUNK_OVERLAP=50
+CHUNK_SIZE=2000
+CHUNK_OVERLAP=200
+```
+
+### Frontend
+
+```bash
+cd frontend
+npm install
+```
+
+Create `frontend/.env.local`:
+
+```env
+NEXT_PUBLIC_BACKEND_URL=http://localhost:8000
 ```
 
 ## Run
 
-**1. Start the backend:**
+**1. Start Ollama:**
+
+```bash
+ollama serve
+```
+
+**2. Start the backend:**
 
 ```bash
 uvicorn src.main:app --reload
@@ -117,26 +146,23 @@ uvicorn src.main:app --reload
 
 API available at `http://localhost:8000`. Swagger docs at `http://localhost:8000/docs`.
 
-**2. Start the frontend:**
+**3. Start the frontend:**
 
 ```bash
-streamlit run app.py
+cd frontend
+npm run dev
 ```
 
-Opens at `http://localhost:8501`.
+Opens at `http://localhost:3000`.
 
 ## API Endpoints
 
 | Method | Endpoint | Description |
 |---|---|---|
-| `GET` | `/health` | Health check |
+| `GET` | `/health` | Health check + indexed document count |
 | `POST` | `/upload` | Upload PDF/TXT for processing |
 | `GET` | `/status/{job_id}` | Poll upload job progress |
 | `POST` | `/ask` | Ask a question against uploaded documents |
-
-### `POST /upload`
-
-Multipart file upload. Returns `job_id` and processing status.
 
 ### `POST /ask`
 
@@ -152,10 +178,12 @@ Returns the LLM answer, confidence score, and source chunks.
 
 ## Key Design Decisions
 
-- **Document isolation**: Queries can be scoped to a specific `document_id` to prevent cross-document contamination
-- **Hybrid search > pure vector search**: BM25 catches exact term matches that embeddings miss (acronyms, proper nouns, codes)
-- **Local-first**: No API keys needed for the core pipeline. Ollama runs the LLM on your own hardware
-- **Separation of concerns**: Streamlit frontend only talks to the backend over HTTP — zero shared imports
+- **Document isolation**: Queries are scoped to a specific `document_id` to prevent cross-document contamination in the FAISS index
+- **Table-aware extraction**: Each PDF page runs both `extract_text()` and `extract_tables()` — tables are converted to markdown and appended so the LLM receives structured data
+- **Hybrid search > pure vector**: BM25 catches exact term matches that embeddings miss (acronyms, proper nouns, numeric codes)
+- **Table-aware system prompt**: Gemma is explicitly instructed to recognise and reconstruct four table formats (markdown, flat/collapsed text, key-value pairs, CSV) and output answers as markdown tables
+- **Local-first**: No API keys, no data leaves your machine. Ollama runs the LLM on your own hardware
+- **Separation of concerns**: Next.js frontend communicates with the backend only over HTTP — no shared imports
 - **Persistence**: FAISS index and chunk data survive server restarts via pickle serialization to `./data/`
 
 ## License
