@@ -1,8 +1,12 @@
 """
 Embedding Service
-=================
-Wraps the ``sentence-transformers`` library to produce dense vector
-embeddings using the **all-MiniLM-L6-v2** model (384-dimensional).
+-----------------
+Wraps sentence-transformers to produce dense vector embeddings
+using the configured BGE model (default: BAAI/bge-base-en-v1.5, 768-dim).
+
+BGE requires a specific prefix when encoding user queries for retrieval.
+Use embed_query() for questions and embed_chunks() / embed_text() for documents.
+Changing the model requires clearing ./data/ and re-uploading all documents.
 """
 
 import logging
@@ -11,96 +15,107 @@ from typing import List
 import numpy as np
 from sentence_transformers import SentenceTransformer
 
+from src.core.config import settings
 from src.utils.errors import EmbeddingError
 
 logger = logging.getLogger(__name__)
 
-# Model identifier — lightweight, fast, and broadly effective
-_MODEL_NAME: str = "all-MiniLM-L6-v2"
-_EMBEDDING_DIMENSION: int = 384
+# BGE retrieval prefix — applied automatically by embed_query().
+# Do not add it manually.
+_BGE_QUERY_PREFIX: str = "Represent this sentence for searching relevant passages: "
 
 
 class EmbeddingService:
     """
-    Generates sentence-level embeddings using a pre-trained transformer.
+    Generates dense vector embeddings using a BGE sentence-transformer model.
 
-    The model is loaded **once** at instantiation and reused across calls.
+    Two encoding methods are provided:
+    - embed_query()  — for user questions (adds the BGE query prefix).
+    - embed_chunks() — for document passages (no prefix).
+
+    The model is loaded once at startup and reused for all calls.
     """
 
     def __init__(self) -> None:
-        logger.info("Loading sentence-transformer model '%s' …", _MODEL_NAME)
+        self.model_name: str = settings.EMBEDDING_MODEL
+        self.dimension: int = settings.EMBEDDING_DIMENSION
+
+        logger.info(
+            "Loading embedding model '%s' (dim=%d) …",
+            self.model_name,
+            self.dimension,
+        )
         try:
-            self.model: SentenceTransformer = SentenceTransformer(_MODEL_NAME)
+            self.model: SentenceTransformer = SentenceTransformer(self.model_name)
         except Exception as exc:
             raise EmbeddingError(
-                f"Failed to load embedding model '{_MODEL_NAME}': {exc}"
+                f"Failed to load embedding model '{self.model_name}': {exc}"
             ) from exc
+
         logger.info(
-            "Model loaded successfully (dimension=%d)", _EMBEDDING_DIMENSION
+            "Embedding model loaded (model='%s', dimension=%d)",
+            self.model_name,
+            self.dimension,
         )
 
-    # ------------------------------------------------------------------ #
-    #  Single-text embedding
-    # ------------------------------------------------------------------ #
+    def embed_query(self, query: str) -> np.ndarray:
+        """
+        Embed a user question for retrieval.
+
+        Applies the BGE query prefix before encoding.
+        Always use this method for questions — never embed_text() or embed_chunks().
+
+        Returns a 1-D float32 array of shape (dimension,).
+        """
+        prefixed = _BGE_QUERY_PREFIX + query
+        logger.debug("Embedding query (%d chars, with BGE prefix)", len(prefixed))
+        try:
+            embedding: np.ndarray = self.model.encode(
+                prefixed,
+                convert_to_numpy=True,
+                show_progress_bar=False,
+                normalize_embeddings=True,
+            )
+            return embedding.astype(np.float32)
+        except Exception as exc:
+            raise EmbeddingError(f"Failed to embed query: {exc}") from exc
 
     def embed_text(self, text: str) -> np.ndarray:
         """
-        Compute the embedding for a single piece of text.
+        Embed a single document passage (no query prefix).
 
-        Args:
-            text: The input string to embed.
-
-        Returns:
-            A 1-D ``numpy.ndarray`` of shape ``(384,)`` with dtype ``float32``.
-
-        Raises:
-            EmbeddingError: If encoding fails.
+        Returns a 1-D float32 array of shape (dimension,).
         """
-        logger.debug("Embedding single text (%d chars)", len(text))
+        logger.debug("Embedding passage (%d chars)", len(text))
         try:
             embedding: np.ndarray = self.model.encode(
                 text,
                 convert_to_numpy=True,
                 show_progress_bar=False,
+                normalize_embeddings=True,
             )
             return embedding.astype(np.float32)
         except Exception as exc:
-            raise EmbeddingError(
-                f"Failed to embed text: {exc}"
-            ) from exc
-
-    # ------------------------------------------------------------------ #
-    #  Batch embedding
-    # ------------------------------------------------------------------ #
+            raise EmbeddingError(f"Failed to embed text: {exc}") from exc
 
     def embed_chunks(self, chunks: List[str]) -> np.ndarray:
         """
-        Compute embeddings for a list of text chunks.
+        Embed a batch of document passages (no query prefix).
 
-        A ``tqdm`` progress bar is displayed during encoding.
-
-        Args:
-            chunks: List of text strings to embed.
-
-        Returns:
-            A 2-D ``numpy.ndarray`` of shape ``(len(chunks), 384)``
-            with dtype ``float32``.
-
-        Raises:
-            EmbeddingError: If encoding fails.
+        Returns a 2-D float32 array of shape (len(chunks), dimension).
         """
-        logger.info("Embedding %d chunks …", len(chunks))
+        logger.info("Embedding %d passage chunks …", len(chunks))
         try:
             embeddings: np.ndarray = self.model.encode(
                 chunks,
                 convert_to_numpy=True,
                 show_progress_bar=True,
                 batch_size=32,
+                normalize_embeddings=True,
             )
             embeddings = embeddings.astype(np.float32)
-
             logger.info(
-                "Embedding complete — shape %s, dtype %s",
+                "Batch embedding complete — shape %s, dtype %s",
                 embeddings.shape,
                 embeddings.dtype,
             )
@@ -110,11 +125,6 @@ class EmbeddingService:
                 f"Failed to embed {len(chunks)} chunks: {exc}"
             ) from exc
 
-    # ------------------------------------------------------------------ #
-    #  Metadata
-    # ------------------------------------------------------------------ #
-
-    @staticmethod
-    def get_embedding_dimension() -> int:
-        """Return the dimensionality of the embedding vectors (384)."""
-        return _EMBEDDING_DIMENSION
+    def get_embedding_dimension(self) -> int:
+        """Return the vector dimension of the loaded embedding model."""
+        return self.dimension

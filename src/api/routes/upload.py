@@ -11,7 +11,6 @@ from fastapi import APIRouter, File, HTTPException, UploadFile, BackgroundTasks
 
 from src.core.config import settings
 from src.ingestion.processor import DocumentProcessor
-from src.embeddings.embedding import EmbeddingService
 from src.models.schemas import UploadResponse
 from src.utils.errors import DocumentProcessingError, EmbeddingError, RetrievalError
 from src.tasks.uploader import process_upload_task
@@ -21,9 +20,8 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
-# Service singletons (created once when this module is first imported)
+# DocumentProcessor holds no ML models — safe to create once at module load.
 _processor = DocumentProcessor()
-_embedding_service = EmbeddingService()
 
 
 @router.post("/upload", response_model=UploadResponse)
@@ -72,7 +70,7 @@ async def upload_document(
                 filename=filename,
                 content_type=content_type,
                 processor=_processor,
-                embedding_service=_embedding_service
+                embedding_service=state.embedding_service  # shared singleton
             )
             return UploadResponse(
                 document_id=job_id,
@@ -89,7 +87,7 @@ async def upload_document(
                 filename=filename,
                 content_type=content_type,
                 processor=_processor,
-                embedding_service=_embedding_service
+                embedding_service=state.embedding_service  # shared singleton
             )
             
             job = state.job_tracker.get_job(job_id)

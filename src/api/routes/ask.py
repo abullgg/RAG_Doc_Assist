@@ -1,15 +1,29 @@
 """
-POST /ask — Question-Answering Endpoint
+POST /ask — Question-answering endpoint.
+
+Embeds the question, runs hybrid retrieval (FAISS + BM25),
+and sends retrieved passages to the local Ollama LLM for a grounded answer.
+
+Pipeline
+--------
+1. embed_query()        -- BGE query prefix applied (via state.embedding_service)
+2. hybrid_search()      -- FAISS cosine + BM25 fused; fetches RERANKER_TOP_N candidates
+3. CrossEncoderReranker -- scores every (query, chunk) pair; keeps top_k best
+4. build context        -- join top_k chunks with source labels
+5. LLMService           -- grounded answer generation via Ollama
+
+Step 3 is skipped when RERANKER_ENABLED=false in config / .env,
+or when state.reranker is None (startup didn't initialize it).
 """
 
+import asyncio
 import logging
-from typing import Dict, List, Optional
+from typing import List, Optional, Tuple
 
 import numpy as np
 from fastapi import APIRouter, HTTPException
 
-from src.embeddings.embedding import EmbeddingService
-from src.embeddings.embedding import EmbeddingService
+from src.core.config import settings
 from src.generation.llm import LLMService
 from src.models.schemas import AskRequest, AskResponse
 from src.utils.errors import EmbeddingError, RetrievalError, LLMServiceError
@@ -19,23 +33,13 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
-# Re-use the same service singletons that upload.py creates.
-# EmbeddingService is heavy (loads the model), so we import lazily to
-# avoid loading the model twice if upload.py was imported first.
-# avoid loading the model twice if upload.py was imported first.
-_embedding_service: Optional[EmbeddingService] = None
+# ML model singletons (embedding_service, reranker) live in src.main and are
+# initialized ONCE in the startup event. Access them via state.embedding_service
+# and state.reranker. Only the LLM client (no GPU weights in-process) stays local.
 _llm_service: Optional[LLMService] = None
 
 
-def _get_embedding_service() -> EmbeddingService:
-    global _embedding_service
-    if _embedding_service is None:
-        _embedding_service = EmbeddingService()
-    return _embedding_service
-
-
 def _get_llm_service() -> LLMService:
-    """Lazily initialise — server can start without ANTHROPIC_API_KEY."""
     global _llm_service
     if _llm_service is None:
         _llm_service = LLMService()
@@ -45,15 +49,17 @@ def _get_llm_service() -> LLMService:
 @router.post("/ask", response_model=AskResponse)
 async def ask_question(request: AskRequest) -> AskResponse:
     """
-    Ask a Question.
+    Ask a question against indexed documents.
 
-    Embeds the question, retrieves the top-K most relevant chunks from
-    FAISS, and sends them to Claude to generate a grounded answer.
+    Retrieves the most relevant passages from the FAISS + BM25 index,
+    optionally reranks them with a cross-encoder, and returns an answer
+    grounded strictly in those passages.
     """
     logger.info(
-        "===== Ask request: '%s' (top_k=%d) =====",
+        "===== Ask request: '%s' (top_k=%d, reranker=%s) =====",
         request.question,
         request.top_k,
+        settings.RERANKER_ENABLED,
     )
 
     # --- Pre-flight checks ------------------------------------------------
@@ -69,32 +75,32 @@ async def ask_question(request: AskRequest) -> AskResponse:
             detail="The FAISS index is empty. Upload a document first.",
         )
 
+    if state.embedding_service is None:
+        raise HTTPException(
+            status_code=503,
+            detail="Embedding service not ready. Server may still be starting up.",
+        )
+
     try:
-        embedding_svc = _get_embedding_service()
+        # Step 1: Embed the query
+        # embed_query() applies the BGE retrieval prefix so the vector is
+        # in the correct query space for cosine similarity against passages.
+        query_embedding: np.ndarray = state.embedding_service.embed_query(request.question)
 
-        # 1. Embed the question
-        query_embedding: np.ndarray = embedding_svc.embed_text(request.question)
+        # Step 2: Hybrid retrieval (Stage 1)
+        # When reranking is enabled we fetch RERANKER_TOP_N candidates --
+        # a broader net -- so the cross-encoder has enough material to work
+        # with. Without reranking we fetch exactly request.top_k.
+        retrieve_k: int = settings.RERANKER_TOP_N if state.reranker else request.top_k
 
-        # 2. Hybrid / Semantic Search
-        use_hybrid = True
-        if use_hybrid:
-            source_texts, similarities = state.retrieval_service.hybrid_search(
-                query_embedding=query_embedding,
-                query_text=request.question,
-                faiss_index=state.faiss_index,
-                hybrid_retriever=state.hybrid_retriever,
-                top_k=request.top_k,
-                filter_doc_id=request.document_id
-            )
-        else:
-            results: List[Dict] = state.retrieval_service.search(
-                query_embedding=query_embedding,
-                faiss_index=state.faiss_index,
-                top_k=request.top_k,
-                filter_doc_id=request.document_id
-            )
-            source_texts = [r["chunk"] for r in results]
-            similarities = [r["score"] for r in results]
+        source_texts, similarities = state.retrieval_service.hybrid_search(
+            query_embedding=query_embedding,
+            query_text=request.question,
+            faiss_index=state.faiss_index,
+            hybrid_retriever=state.hybrid_retriever,
+            top_k=retrieve_k,
+            filter_doc_id=request.document_id,
+        )
 
         if not source_texts:
             return AskResponse(
@@ -103,26 +109,48 @@ async def ask_question(request: AskRequest) -> AskResponse:
                 confidence=0.0,
             )
 
-        # 3. Build context from retrieved chunks
+        # Step 3: Cross-encoder reranking (Stage 2)
+        # The cross-encoder scores every (query, chunk) pair jointly using
+        # full self-attention, producing much more accurate relevance scores
+        # than the bi-encoder cosine similarity from Stage 1.
+        #
+        # CrossEncoder.predict() is CPU-bound, so we offload it to a thread
+        # pool to keep the FastAPI event loop responsive.
+        if state.reranker:
+            ranked_pairs: List[Tuple[str, float]] = await asyncio.to_thread(
+                state.reranker.rerank,
+                request.question,
+                source_texts,
+                request.top_k,
+            )
+            source_texts = [text for text, _ in ranked_pairs]
+            similarities = [score for _, score in ranked_pairs]
+            logger.info(
+                "Reranking complete -- %d candidates -> %d chunks (top score=%.4f)",
+                retrieve_k,
+                len(source_texts),
+                similarities[0] if similarities else 0.0,
+            )
+
+        # Step 4: Build context
         context: str = "\n\n---\n\n".join(
             f"[Source {i + 1}]:\n{chunk}"
             for i, chunk in enumerate(source_texts)
         )
 
-        # 4. Call Claude
+        # Step 5: Generate answer
         llm = _get_llm_service()
         answer: str = llm.generate_answer(
             question=request.question,
             context=context,
         )
 
-        # 5. Compute average confidence from similarity scores
         avg_confidence: float = round(
             sum(similarities) / len(similarities), 4
         )
 
         logger.info(
-            "Answer generated — %d sources, avg_confidence=%.4f",
+            "Answer generated -- %d sources, avg_confidence=%.4f",
             len(source_texts),
             avg_confidence,
         )

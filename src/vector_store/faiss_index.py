@@ -1,9 +1,13 @@
 """
 FAISS Retrieval Service
-=======================
-Manages a FAISS ``IndexFlatL2`` index for dense-vector similarity search.
-Stores the original chunk texts alongside their index positions so that
-search results include the actual source passages.
+-----------------------
+Manages a FAISS IndexFlatIP (inner product) index for dense-vector similarity search.
+
+Embeddings are L2-normalised at encode time, so inner product equals cosine
+similarity. Scores fall in the range (-1, 1] where 1.0 is a perfect match.
+
+A chunk store (dict of FAISS position → (doc_id, chunk_text)) maps search
+results back to the original passages and their source documents.
 """
 
 import logging
@@ -12,6 +16,7 @@ from typing import Dict, List, Optional, Tuple
 import faiss
 import numpy as np
 
+from src.core.config import settings
 from src.utils.errors import RetrievalError
 
 logger = logging.getLogger(__name__)
@@ -19,59 +24,51 @@ logger = logging.getLogger(__name__)
 
 class RetrievalService:
     """
-    Thin wrapper around FAISS that pairs every indexed vector with
-    its source ``(doc_id, chunk_text)`` metadata.
+    Wraps FAISS and pairs every indexed vector with its source (doc_id, chunk_text).
+
+    Args:
+        dimension: Embedding vector size. Must match the active embedding model.
     """
 
-    def __init__(self, dimension: int = 384) -> None:
-        self.dimension = dimension
-        # Internal store: maps a global vector index → (doc_id, chunk_text)
+    def __init__(self, dimension: int = settings.EMBEDDING_DIMENSION) -> None:
+        self.dimension: int = dimension
+        # Maps FAISS vector position → (doc_id, chunk_text)
         self._chunk_store: Dict[int, Tuple[str, str]] = {}
-
-    # ------------------------------------------------------------------ #
-    #  Index Management
-    # ------------------------------------------------------------------ #
 
     def add_to_index(
         self,
         embeddings: np.ndarray,
         doc_id: str,
         chunks: List[str],
-        existing_index: Optional[faiss.IndexFlatL2] = None,
-    ) -> faiss.IndexFlatL2:
+        existing_index: Optional[faiss.IndexFlatIP] = None,
+    ) -> faiss.IndexFlatIP:
         """
-        Insert *embeddings* into a FAISS index (creating one if needed)
-        and record the matching chunk texts for later retrieval.
+        Add embeddings to the FAISS index and record their source chunks.
+
+        Creates a new IndexFlatIP if no existing index is provided.
 
         Args:
-            embeddings:     2-D float32 array of shape ``(n, dim)``.
-            doc_id:         The document ID these chunks belong to.
-            chunks:         The original text chunks, same length as *embeddings*.
-            existing_index: An existing FAISS index to append to; if ``None``
-                            a new ``IndexFlatL2`` is created.
+            embeddings:     2-D float32 array of shape (n, dimension).
+            doc_id:         ID of the document these chunks belong to.
+            chunks:         Original text chunks — must have the same length as embeddings.
+            existing_index: Existing FAISS index to append to. Creates a new one if None.
 
         Returns:
-            The (possibly newly created) FAISS index.
+            The updated (or newly created) FAISS index.
 
         Raises:
-            RetrievalError: If the operation fails.
+            RetrievalError: If the add operation fails.
         """
         try:
-            dimension: int = embeddings.shape[1]
-
             if existing_index is None:
-                logger.info("Creating new FAISS IndexFlatL2 (dim=%d)", dimension)
-                index = faiss.IndexFlatL2(dimension)
+                logger.info("Creating new FAISS IndexFlatIP (dim=%d)", self.dimension)
+                index = faiss.IndexFlatIP(self.dimension)
             else:
                 index = existing_index
 
-            # Record the starting offset so we can map vector positions → chunks
             start_pos: int = index.ntotal
-
-            # Add vectors to the index
             index.add(embeddings)
 
-            # Map each new vector position to its source chunk
             for i, chunk in enumerate(chunks):
                 self._chunk_store[start_pos + i] = (doc_id, chunk)
 
@@ -88,91 +85,65 @@ class RetrievalService:
                 f"Failed to add {len(chunks)} vectors to index: {exc}"
             ) from exc
 
-    # ------------------------------------------------------------------ #
-    #  Search
-    # ------------------------------------------------------------------ #
-
     def search(
         self,
         query_embedding: np.ndarray,
-        faiss_index: faiss.IndexFlatL2,
+        faiss_index: faiss.IndexFlatIP,
         top_k: int = 3,
-        filter_doc_id: Optional[str] = None
+        filter_doc_id: Optional[str] = None,
     ) -> List[Dict[str, object]]:
         """
-        Find the *top_k* most similar chunks to *query_embedding*.
-
-        Similarity is computed as ``1 / (1 + L2_distance)`` so that
-        values are in (0, 1] with 1 = perfect match.
+        Find the top-k most similar chunks to a query embedding.
 
         Args:
-            query_embedding: 1-D or 2-D float32 query vector.
+            query_embedding: 1-D or 2-D float32 query vector from embed_query().
             faiss_index:     The FAISS index to search.
             top_k:           Number of results to return.
+            filter_doc_id:   If set, only return chunks from this document.
 
         Returns:
-            A list of dicts, each containing:
-                - ``chunk``      : the original text passage
-                - ``doc_id``     : source document ID
-                - ``score``      : similarity score in (0, 1]
-                - ``distance``   : raw L2 distance
+            List of dicts with keys: chunk, doc_id, score.
 
         Raises:
-            RetrievalError: If the search operation fails.
+            RetrievalError: If the FAISS search fails.
         """
         try:
-            # FAISS expects a 2-D query matrix
             if query_embedding.ndim == 1:
                 query_embedding = query_embedding.reshape(1, -1)
 
-            # Clamp top_k to what the index actually holds
-            if filter_doc_id:
-                effective_k = faiss_index.ntotal
-            else:
-                effective_k = min(top_k, faiss_index.ntotal)
+            effective_k = faiss_index.ntotal if filter_doc_id else min(top_k, faiss_index.ntotal)
+            if effective_k == 0:
+                return []
 
             logger.info(
-                "Searching FAISS index (%d vectors) for top-%d matches (filter_doc_id=%s)",
+                "Searching FAISS index (%d vectors) for top-%d (filter_doc_id=%s)",
                 faiss_index.ntotal,
                 effective_k,
-                filter_doc_id
+                filter_doc_id,
             )
 
-            distances, indices = faiss_index.search(query_embedding, effective_k)
+            scores_raw, indices = faiss_index.search(query_embedding, effective_k)
 
             results: List[Dict[str, object]] = []
-            for rank, (dist, idx) in enumerate(zip(distances[0], indices[0])):
+            for rank, (score, idx) in enumerate(zip(scores_raw[0], indices[0])):
                 if idx == -1:
-                    # FAISS returns -1 when there are fewer vectors than top_k
-                    continue
+                    continue  # FAISS sentinel for "no result"
 
-                doc_id, chunk_text = self._chunk_store.get(
-                    int(idx), ("unknown", "")
-                )
-                
+                doc_id, chunk_text = self._chunk_store.get(int(idx), ("unknown", ""))
+
                 if filter_doc_id and doc_id != filter_doc_id:
                     continue
 
-                # Convert L2 distance → similarity score
-                similarity: float = 1.0 / (1.0 + float(dist))
-
-                results.append(
-                    {
-                        "chunk": chunk_text,
-                        "doc_id": doc_id,
-                        "score": round(similarity, 4),
-                        "distance": round(float(dist), 4),
-                    }
-                )
+                results.append({
+                    "chunk": chunk_text,
+                    "doc_id": doc_id,
+                    "score": round(float(score), 4),
+                })
                 logger.debug(
-                    "  Rank %d: doc=%s, score=%.4f, dist=%.4f, preview='%s…'",
-                    rank + 1,
-                    doc_id,
-                    similarity,
-                    dist,
-                    chunk_text[:80],
+                    "  Rank %d: doc=%s, score=%.4f, preview='%s…'",
+                    rank + 1, doc_id, score, chunk_text[:80],
                 )
-                
+
                 if len(results) >= top_k:
                     break
 
@@ -180,31 +151,30 @@ class RetrievalService:
             return results
 
         except Exception as exc:
-            raise RetrievalError(
-                f"FAISS search failed: {exc}"
-            ) from exc
-
-    # ------------------------------------------------------------------ #
-    #  Hybrid Search
-    # ------------------------------------------------------------------ #
+            raise RetrievalError(f"FAISS search failed: {exc}") from exc
 
     def get_all_chunks(self) -> List[Tuple[str, str]]:
-        """Return all (doc_id, text) chunks correctly ordered by FAISS integer index."""
+        """
+        Return all (doc_id, text) pairs ordered by FAISS index position.
+        Used by HybridRetriever to build the BM25 corpus.
+        """
         return [self._chunk_store[i] for i in range(len(self._chunk_store))]
 
-    def hybrid_search(self, query_embedding, query_text, faiss_index, hybrid_retriever, top_k=3, filter_doc_id=None):
+    def hybrid_search(
+        self,
+        query_embedding: np.ndarray,
+        query_text: str,
+        faiss_index: faiss.IndexFlatIP,
+        hybrid_retriever,
+        top_k: int = 3,
+        filter_doc_id: Optional[str] = None,
+    ) -> Tuple[List[str], List[float]]:
         """
-        Hybrid search: semantic + keyword combined
-        
-        Args:
-            query_embedding: 384-dim vector
-            query_text: Raw question text
-            faiss_index: FAISS index
-            hybrid_retriever: HybridRetriever instance
-            top_k: Results to return
-        
+        Run hybrid search (FAISS + BM25) via HybridRetriever.
+        Falls back to pure semantic search if BM25 is unavailable.
+
         Returns:
-            Tuple of (chunks, scores)
+            Tuple of (chunks, scores).
         """
         try:
             chunks, scores = hybrid_retriever.hybrid_search(
@@ -212,36 +182,17 @@ class RetrievalService:
                 query_text=query_text,
                 faiss_index=faiss_index,
                 top_k=top_k,
-                filter_doc_id=filter_doc_id
+                filter_doc_id=filter_doc_id,
             )
             return chunks, scores
-        except Exception as e:
-            logger.error(f"Hybrid search failed: {str(e)}")
-            # Fallback to semantic-only
+        except Exception as exc:
+            logger.error("Hybrid search failed: %s — falling back to semantic", exc)
             results = self.search(query_embedding, faiss_index, top_k, filter_doc_id=filter_doc_id)
             return [r["chunk"] for r in results], [r["score"] for r in results]
 
-    # ------------------------------------------------------------------ #
-    #  Stats
-    # ------------------------------------------------------------------ #
-
     @staticmethod
-    def get_index_stats(
-        faiss_index: Optional[faiss.IndexFlatL2],
-    ) -> Dict[str, object]:
-        """
-        Return basic statistics about the FAISS index.
-
-        Args:
-            faiss_index: The FAISS index (may be ``None``).
-
-        Returns:
-            A dict with ``total_vectors`` and ``dimension``.
-        """
+    def get_index_stats(faiss_index: Optional[faiss.IndexFlatIP]) -> Dict[str, object]:
+        """Return total vector count and dimension of the FAISS index."""
         if faiss_index is None:
             return {"total_vectors": 0, "dimension": 0}
-
-        return {
-            "total_vectors": faiss_index.ntotal,
-            "dimension": faiss_index.d,
-        }
+        return {"total_vectors": faiss_index.ntotal, "dimension": faiss_index.d}

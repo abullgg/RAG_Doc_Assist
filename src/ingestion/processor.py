@@ -1,8 +1,8 @@
 """
 Document Processor
-==================
-Handles file ingestion (PDF / TXT), text extraction, semantic chunking with
-LangChain's RecursiveCharacterTextSplitter, and unique document ID generation.
+------------------
+Handles file ingestion (PDF / TXT): text and table extraction,
+semantic chunking, and unique document ID generation.
 """
 
 import io

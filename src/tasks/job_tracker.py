@@ -1,7 +1,8 @@
 """
 Job Tracker
-===========
-Maintains an in-memory dictionary of all active block-processing tasks.
+-----------
+In-memory tracker for async upload jobs. Stores status, progress, and error
+for each job so the frontend can poll for completion.
 """
 
 from typing import Dict, Any, Optional

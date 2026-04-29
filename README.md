@@ -1,82 +1,83 @@
 # RAG Document Assistant
 
-Upload a PDF or TXT → it gets extracted, chunked, embedded, and indexed → ask questions in a chat interface → get answers grounded strictly in your document.
+Upload a PDF or TXT → ask questions → get answers grounded strictly in your document.
 
-No cloud dependencies. Runs entirely on your machine using Ollama for LLM inference and FAISS for vector search.
+Runs entirely on your machine. No cloud. No API keys.
+
+---
 
 ## How It Works
 
 ```
-PDF/TXT  →  Extract Text + Tables  →  Chunk (RecursiveCharacterTextSplitter)
-                                               ↓
-                                       Embed (all-MiniLM-L6-v2, 384d)
-                                               ↓
-                                       Index (FAISS + BM25)
-                                               ↓
-               Question  →  Hybrid Search (70% semantic + 30% keyword)
-                                               ↓
-                               Top-K chunks → Ollama (Gemma 3 4B) → Answer
+Upload PDF / TXT
+      │
+      ▼
+Extract text + tables  →  Chunk  →  Embed passages (BGE 768d)  →  FAISS + BM25 index
+                                                                            │
+                                          Question  →  embed_query() (BGE + prefix)
+                                                                            │
+                                                  Stage 1 — Hybrid search (FAISS 70% + BM25 30%)
+                                                  Retrieve RERANKER_TOP_N candidates
+                                                                            │
+                                                  Stage 2 — Cross-encoder rerank
+                                                  Score every (query, chunk) pair jointly
+                                                  Keep top_k highest-scoring chunks
+                                                                            │
+                                                            Context  →  Ollama (Gemma 3 4B)  →  Answer
 ```
 
-**Hybrid retrieval** combines FAISS cosine similarity with BM25 keyword matching (weighted 70/30). This catches both semantically similar passages and exact keyword matches that pure vector search would miss.
+**Two-stage retrieval** separates speed from accuracy. Stage 1 (bi-encoder + BM25) casts a wide net fast. Stage 2 (cross-encoder) rescores every candidate pair with full attention and keeps only the most relevant chunks for the LLM.
 
-**Table-aware ingestion**: `pdfplumber` runs both `extract_text()` and `extract_tables()` per page. Detected tables are converted to GitHub-style markdown and appended alongside the prose text so the LLM receives structured data instead of collapsed rows.
+**Hybrid retrieval** fuses FAISS vector search (70%) with BM25 keyword scoring (30%) so exact terms, acronyms, and numeric codes are never missed by pure semantic search.
+
+**Table-aware ingestion** — PDF tables are extracted and converted to markdown so the LLM receives structured data, not collapsed rows.
+
+---
 
 ## Tech Stack
 
 | Layer | Tech |
 |---|---|
 | Backend API | FastAPI + Uvicorn |
-| Frontend | Next.js 16 (App Router) |
-| LLM | Ollama (default: `gemma3:4b`) |
-| Embeddings | `all-MiniLM-L6-v2` via sentence-transformers |
-| Vector Store | FAISS (IndexFlatL2) |
-| Keyword Search | BM25 (rank-bm25) |
-| PDF Parsing | pdfplumber (text + table extraction) |
-| Text Splitting | LangChain RecursiveCharacterTextSplitter |
-| Markdown Rendering | react-markdown + remark-gfm |
-| Persistence | Pickle-based state persistence to disk |
+| Frontend | Next.js (App Router) |
+| LLM | Ollama — `gemma3:4b` (local) |
+| Bi-encoder Embeddings | `BAAI/bge-base-en-v1.5` · 768-dim |
+| Vector Store | FAISS `IndexFlatIP` |
+| Keyword Search | BM25 (`rank-bm25`) |
+| Cross-Encoder Reranker | `BAAI/bge-reranker-base` |
+| PDF Parsing | pdfplumber |
+| Text Splitting | LangChain `RecursiveCharacterTextSplitter` |
+
+---
 
 ## Project Structure
 
 ```
 src/
-├── main.py                  # FastAPI app entry point, global state, CORS
+├── main.py                  # FastAPI app, global state, CORS
+├── core/config.py           # Settings via Pydantic + .env
 ├── api/routes/
-│   ├── upload.py            # POST /upload — file ingestion + job tracking
-│   ├── ask.py               # POST /ask — question answering with doc isolation
-│   ├── health.py            # GET /health
-│   └── status.py            # GET /status/{job_id}
-├── ingestion/
-│   └── processor.py         # PDF/TXT extraction, table → markdown, chunking
-├── embeddings/
-│   └── embedding.py         # Sentence-transformer wrapper
-├── vector_store/
-│   └── faiss_index.py       # FAISS index management + chunk storage
+│   ├── upload.py            # POST /upload
+│   ├── ask.py               # POST /ask  (embed → hybrid → rerank → LLM)
+│   ├── health.py            # GET  /health
+│   └── status.py            # GET  /status/{job_id}
+├── ingestion/processor.py   # PDF/TXT extraction, table → markdown, chunking
+├── embeddings/embedding.py  # BGE bi-encoder (embed_query / embed_chunks)
+├── vector_store/            # FAISS index management
 ├── retrieval/
-│   └── hybrid.py            # BM25 + FAISS hybrid search
-├── generation/
-│   └── llm.py               # Ollama client + table-aware system prompt
-├── persistence/
-│   └── storage.py           # Save/load FAISS index + chunks to disk
-├── core/
-│   └── config.py            # Pydantic settings from .env
-├── models/
-│   └── schemas.py           # Request/response Pydantic models
-├── tasks/
-│   └── job_tracker.py       # Async upload job tracking
-└── utils/
-    ├── logger.py
-    └── errors.py
+│   ├── hybrid.py            # Stage 1 — BM25 + FAISS hybrid search
+│   └── reranker.py          # Stage 2 — cross-encoder reranking
+├── generation/llm.py        # Ollama client + system prompt
+├── persistence/storage.py   # Save/load index to ./data/
+└── tasks/job_tracker.py     # Async upload job tracking
 
-frontend/                    # Next.js 16 App Router frontend
-├── app/
-│   ├── page.tsx             # Main chat interface
-│   ├── globals.css          # Obsidian Flux dark design system
-│   └── layout.tsx
-└── lib/
-    └── api.ts               # Typed API client for all 4 endpoints
+frontend/
+├── app/page.tsx             # Chat UI (upload, thread, sources)
+├── app/globals.css          # Dark design system
+└── lib/api.ts               # Typed API client
 ```
+
+---
 
 ## Setup
 
@@ -93,26 +94,25 @@ git clone https://github.com/abullgg/RAG_Doc_Assist.git
 cd RAG_Doc_Assist
 python -m venv venv
 venv\Scripts\activate        # Windows
-# source venv/bin/activate   # Linux/Mac
 pip install -r requirements.txt
 ```
 
-### Pull the LLM model
+### Pull the LLM
 
 ```bash
 ollama pull gemma3:4b
 ```
 
-You can swap this for any Ollama model by setting `MODEL_NAME` in `.env`.
+### Environment
 
-### Environment Variables
-
-Create a `.env` file in the project root:
+Create `.env` in the project root:
 
 ```env
 OLLAMA_BASE_URL=http://localhost:11434
 MODEL_NAME=gemma3:4b
 FAISS_INDEX_PATH=./data/faiss_index
+EMBEDDING_MODEL=BAAI/bge-base-en-v1.5
+EMBEDDING_DIMENSION=768
 CHUNK_SIZE=2000
 CHUNK_OVERLAP=200
 ```
@@ -130,61 +130,60 @@ Create `frontend/.env.local`:
 NEXT_PUBLIC_BACKEND_URL=http://localhost:8000
 ```
 
+---
+
 ## Run
 
-**1. Start Ollama:**
-
 ```bash
+# 1. Ollama
 ollama serve
-```
 
-**2. Start the backend:**
-
-```bash
+# 2. Backend
 uvicorn src.main:app --reload
+
+# 3. Frontend
+cd frontend && npm run dev
 ```
 
-API available at `http://localhost:8000`. Swagger docs at `http://localhost:8000/docs`.
+- API: `http://localhost:8000` · Swagger: `http://localhost:8000/docs`
+- UI: `http://localhost:3000`
 
-**3. Start the frontend:**
+---
 
-```bash
-cd frontend
-npm run dev
-```
-
-Opens at `http://localhost:3000`.
-
-## API Endpoints
+## API
 
 | Method | Endpoint | Description |
 |---|---|---|
 | `GET` | `/health` | Health check + indexed document count |
-| `POST` | `/upload` | Upload PDF/TXT for processing |
+| `POST` | `/upload` | Upload a PDF or TXT file |
 | `GET` | `/status/{job_id}` | Poll upload job progress |
-| `POST` | `/ask` | Ask a question against uploaded documents |
+| `POST` | `/ask` | Ask a question against the document |
 
-### `POST /ask`
+`POST /ask` body:
 
 ```json
 {
   "question": "What are the key findings?",
-  "document_id": "optional-uuid-to-scope-query",
+  "document_id": "optional-uuid",
   "top_k": 3
 }
 ```
 
-Returns the LLM answer, confidence score, and source chunks.
+Returns: `answer`, `sources[]`, `confidence`.
 
-## Key Design Decisions
+---
 
-- **Document isolation**: Queries are scoped to a specific `document_id` to prevent cross-document contamination in the FAISS index
-- **Table-aware extraction**: Each PDF page runs both `extract_text()` and `extract_tables()` — tables are converted to markdown and appended so the LLM receives structured data
-- **Hybrid search > pure vector**: BM25 catches exact term matches that embeddings miss (acronyms, proper nouns, numeric codes)
-- **Table-aware system prompt**: Gemma is explicitly instructed to recognise and reconstruct four table formats (markdown, flat/collapsed text, key-value pairs, CSV) and output answers as markdown tables
-- **Local-first**: No API keys, no data leaves your machine. Ollama runs the LLM on your own hardware
-- **Separation of concerns**: Next.js frontend communicates with the backend only over HTTP — no shared imports
-- **Persistence**: FAISS index and chunk data survive server restarts via pickle serialization to `./data/`
+## Changing the Embedding Model
+
+> ⚠️ Switching models requires re-uploading all documents.
+
+1. Update `EMBEDDING_MODEL` and `EMBEDDING_DIMENSION` in `.env`
+2. Delete `./data/`
+3. Restart the backend
+
+The persistence layer automatically detects a dimension mismatch and clears the stale index on startup.
+
+---
 
 ## License
 
