@@ -126,8 +126,11 @@ class CrossEncoderReranker:
             ) from exc
 
         # Normalise raw logits → (0, 1] via sigmoid so scores are interpretable
+        # Apply temperature scaling and bias shift to boost non-prose document scores
         def _sigmoid(x: float) -> float:
-            return 1.0 / (1.0 + math.exp(-x))
+            temperature_scaled = x * 1.5  # Spread the scores out
+            bias_shift = 1.0              # Push neutral 0.0 logs to positive
+            return 1.0 / (1.0 + math.exp(-(temperature_scaled + bias_shift)))
 
         scored: List[Tuple[str, float]] = [
             (chunk, round(_sigmoid(float(score)), 4))

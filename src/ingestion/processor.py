@@ -8,11 +8,12 @@ semantic chunking, and unique document ID generation.
 import io
 import logging
 import uuid
+import re
 from typing import List
 
 from fastapi import UploadFile
 import pdfplumber
-from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langchain_text_splitters import RecursiveCharacterTextSplitter, MarkdownHeaderTextSplitter
 
 from src.utils.errors import DocumentProcessingError
 
@@ -23,10 +24,18 @@ class DocumentProcessor:
     """Extracts text from uploaded files and splits it into semantic chunks."""
 
     def __init__(self) -> None:
-        # Initialize RecursiveCharacterTextSplitter with hierarchical separators.
-        # The splitter tries each separator in order, only falling back to the
-        # next one when a chunk still exceeds chunk_size.
-        self.splitter = RecursiveCharacterTextSplitter(
+        # Pass 1: Semantic header splitting
+        self.markdown_splitter = MarkdownHeaderTextSplitter(
+            headers_to_split_on=[
+                ("#", "H1"),
+                ("##", "H2"),
+                ("###", "H3"),
+            ],
+            return_each_line=False,
+        )
+        
+        # Pass 2: Size enforcement safety net
+        self.recursive_splitter = RecursiveCharacterTextSplitter(
             chunk_size=2000,           # Target chunk size in characters
             chunk_overlap=200,         # Overlap for cross-boundary context
             separators=[
@@ -39,7 +48,7 @@ class DocumentProcessor:
             length_function=len,
             is_separator_regex=False,
         )
-        logger.info("DocumentProcessor initialized with LangChain semantic splitter")
+        logger.info("DocumentProcessor initialized with 2-pass semantic splitter")
 
     # ------------------------------------------------------------------ #
     #  Text Extraction
@@ -213,47 +222,119 @@ class DocumentProcessor:
         logger.info("TXT '%s': %d chars extracted", filename, len(text))
         return text
 
-    # ------------------------------------------------------------------ #
-    #  Chunking
-    # ------------------------------------------------------------------ #
+    def normalize_headers(self, text: str) -> str:
+        """
+        Normalize all header formats to Markdown.
+        Handles: numbered sections, ALL-CAPS, underlined, title-case isolated lines.
+        """
+        lines = text.split('\n')
+        normalized_lines = []
+        skip_next = False
+        
+        for i, line in enumerate(lines):
+            if skip_next:
+                skip_next = False
+                continue
+                
+            stripped = line.strip()
+            if not stripped:
+                normalized_lines.append(line)
+                continue
+                
+            # 1. Already Markdown
+            if stripped.startswith('#'):
+                normalized_lines.append(line)
+                continue
+                
+            # 2. Numbered Sections (1. Introduction, 2.1 Methods, 1) Skills)
+            if re.match(r'^\d+(\.\d+)*[\.\)]\s+[A-Z]', stripped):
+                normalized_lines.append(f"# {stripped}")
+                continue
+                
+            # 3. ALL-CAPS Headers
+            if len(stripped) > 3 and stripped.isupper() and not stripped.endswith('.'):
+                normalized_lines.append(f"# {stripped}")
+                continue
+                
+            # 4. Underlined Headers (followed by --- or ===)
+            if i < len(lines) - 1:
+                next_line = lines[i + 1].strip()
+                if re.match(r'^[-=]{3,}$', next_line):
+                    normalized_lines.append(f"# {stripped}")
+                    skip_next = True  # Skip the --- line
+                    continue
+            
+            # 5. Title-Case Isolated Lines
+            is_title_case = stripped[0].isupper()
+            is_short = len(stripped) < 50
+            is_isolated = (
+                i == 0 or 
+                lines[i - 1].strip() == '' or
+                i == len(lines) - 1 or
+                lines[i + 1].strip() == ''
+            )
+            
+            if is_title_case and is_short and is_isolated:
+                # Avoid matching short sentences
+                if not re.search(r'[,\.]$', stripped) and not stripped.startswith(('The ', 'A ', 'An ', 'the ', 'a ', 'an ')):
+                    normalized_lines.append(f"# {stripped}")
+                    continue
+            
+            normalized_lines.append(line)
+            
+        return '\n'.join(normalized_lines)
 
     def chunk_text(self, text: str) -> List[str]:
         """
-        Split text into semantic chunks using LangChain's RecursiveCharacterTextSplitter.
-
-        The splitter respects paragraph boundaries, sentence boundaries, and
-        document structure — headers stay with their content instead of being
-        orphaned into separate chunks.
-
-        Args:
-            text: The full document text.
-
-        Returns:
-            A list of non-empty text chunks.
-
-        Raises:
-            DocumentProcessingError: If text is empty or chunking fails.
+        2-pass semantic chunking:
+        1. Normalize headers to Markdown
+        2. Split by semantic boundaries (MarkdownHeaderTextSplitter)
+        3. Enforce size limits (RecursiveCharacterTextSplitter)
         """
         if not text or not text.strip():
             raise DocumentProcessingError("Cannot chunk empty text")
 
         try:
-            chunks = self.splitter.split_text(text)
-
-            logger.info(
-                "Created %d semantic chunks from text of length %d",
-                len(chunks),
-                len(text),
-            )
-            for i, chunk in enumerate(chunks):
-                logger.debug(
-                    "Chunk %d: %d chars, starts with: %s...",
-                    i,
-                    len(chunk),
-                    chunk[:50],
-                )
-
-            return chunks
+            # Step 1: Normalize headers
+            normalized_text = self.normalize_headers(text)
+            logger.info("Headers normalized to Markdown format")
+            
+            # Step 2: First pass - Semantic splitting
+            try:
+                semantic_chunks = self.markdown_splitter.split_text(normalized_text)
+                logger.info("MarkdownHeaderTextSplitter created %d semantic chunks", len(semantic_chunks))
+            except Exception as e:
+                logger.warning("Markdown splitting failed: %s, using full text as single chunk", e)
+                semantic_chunks = [{"page_content": normalized_text, "metadata": {}}]
+            
+            # Step 3: Second pass - Size enforcement
+            final_chunks = []
+            for i, chunk in enumerate(semantic_chunks):
+                # Handle Document objects (Langchain) vs raw strings/dicts
+                chunk_text = getattr(chunk, 'page_content', chunk.get("page_content", chunk) if isinstance(chunk, dict) else chunk)
+                chunk_metadata = getattr(chunk, 'metadata', chunk.get("metadata", {}) if isinstance(chunk, dict) else {})
+                
+                # Re-attach metadata safely so it is passed to LLM context
+                header_context = " > ".join(str(v) for v in chunk_metadata.values())
+                if header_context:
+                    chunk_text = f"[{header_context}]\n{chunk_text}"
+                
+                chunk_size = len(chunk_text)
+                
+                if chunk_size > 2000:
+                    logger.info("Chunk %d exceeds 2000 chars (%d), recursively splitting", i, chunk_size)
+                    sub_chunks = self.recursive_splitter.split_text(chunk_text)
+                    final_chunks.extend(sub_chunks)
+                else:
+                    final_chunks.append(chunk_text)
+            
+            # Log final statistics
+            logger.info("Final result: %d chunks", len(final_chunks))
+            if final_chunks:
+                sizes = [len(c) for c in final_chunks]
+                logger.info("Chunk sizes - Min: %d, Max: %d, Avg: %d", min(sizes), max(sizes), sum(sizes)//len(sizes))
+            
+            return final_chunks
         except Exception as exc:
             logger.error("Error chunking text: %s", exc)
             raise DocumentProcessingError(

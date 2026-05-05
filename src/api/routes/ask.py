@@ -145,20 +145,20 @@ async def ask_question(request: AskRequest) -> AskResponse:
             context=context,
         )
 
-        avg_confidence: float = round(
-            sum(similarities) / len(similarities), 4
+        max_confidence: float = round(
+            max(similarities) if similarities else 0.0, 4
         )
 
         logger.info(
-            "Answer generated -- %d sources, avg_confidence=%.4f",
+            "Answer generated -- %d sources, max_confidence=%.4f",
             len(source_texts),
-            avg_confidence,
+            max_confidence,
         )
 
         return AskResponse(
             answer=answer,
             sources=source_texts,
-            confidence=avg_confidence,
+            confidence=max_confidence,
         )
 
     except HTTPException:
