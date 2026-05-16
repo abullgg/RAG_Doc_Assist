@@ -3,8 +3,52 @@ Application settings loaded from environment variables or .env file.
 All tuneable values live here — override via .env before launching the server.
 """
 
+from typing import Dict, Literal
+from pydantic import BaseModel
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+
+# ---------------------------------------------------------------------------
+# Chunk-size presets (characters)
+# ---------------------------------------------------------------------------
+
+CHUNK_SIZE_PRESETS: Dict[str, int] = {
+    "technical_spec": 1200,  # Dense specs / manuals → smaller = more precise
+    "narrative": 1800,        # Flowing prose → larger keeps sentences together
+    "data_heavy": 800,        # Table/list-heavy → smallest, tables are atomic
+    "default": 1500,          # Balanced default (was 2000)
+}
+
+DocType = Literal["technical_spec", "narrative", "data_heavy", "default"]
+
+
+# ---------------------------------------------------------------------------
+# Retrieval configuration model
+# ---------------------------------------------------------------------------
+
+class RetrievalConfig(BaseModel):
+    """
+    Controls the retrieval funnel for each /ask request.
+
+    Attributes:
+        max_tokens_for_context: Soft character ceiling for combined context fed
+            to the LLM. Gemma 3 4B has an 8K token window; reserving ~3000
+            chars for context leaves room for the system prompt and generation.
+            (1 token ≈ 4 chars for English, so 3000 chars ≈ 750 tokens.)
+        top_k_candidates: Final number of chunks passed to the LLM after
+            reranking.
+        reranker_top_n: Wider candidate pool fetched from hybrid search before
+            the cross-encoder sees them.
+    """
+
+    max_tokens_for_context: int = 3000
+    top_k_candidates: int = 5
+    reranker_top_n: int = 10
+
+
+# ---------------------------------------------------------------------------
+# Main settings class
+# ---------------------------------------------------------------------------
 
 class Settings(BaseSettings):
     """Application-wide settings, loaded from environment / .env file."""
@@ -28,8 +72,14 @@ class Settings(BaseSettings):
     FAISS_INDEX_PATH: str = "./data/faiss_index"
 
     # ── Ingestion ────────────────────────────────────────────────────────── #
-    CHUNK_SIZE: int = 2000
+    # CHUNK_SIZE / CHUNK_OVERLAP are the fallback values when no doc_type
+    # preset is specified. Prefer CHUNK_SIZE_PRESETS for new uploads.
+    CHUNK_SIZE: int = 1500      # Lowered from 2000 for better Gemma 3 4B fit
     CHUNK_OVERLAP: int = 200
+
+    # Header detection
+    HEADER_DETECTION_ENABLED: bool = True
+    HEADER_CONFIDENCE_THRESHOLD: float = 0.75
 
     # ── Cross-Encoder Reranker ───────────────────────────────────────────── #
     # Reranking runs AFTER hybrid retrieval. Stage 1 retrieves RERANKER_TOP_N
@@ -47,6 +97,9 @@ class Settings(BaseSettings):
     # Number of candidates fetched from hybrid search before reranking.
     # Should be ≥ top_k sent with each /ask request (typically 3-5).
     RERANKER_TOP_N: int = 10
+
+    # ── Context budget ───────────────────────────────────────────────────── #
+    MAX_CONTEXT_CHARS: int = 3000  # Soft ceiling; trimmed from lowest-confidence end
 
     model_config = SettingsConfigDict(env_file=".env", case_sensitive=True, extra="ignore")
 
